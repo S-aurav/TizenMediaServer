@@ -17,7 +17,6 @@ cache/
 temp_videos/
 tmp/
 downloads/
-static/
 autoforward_bot.py
 beckup.html
 Bot.py
