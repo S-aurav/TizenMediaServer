@@ -55,10 +55,10 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 POSTERS = {
     "Shinchan": "/static/shinchan.jpg",
-    "Doraemon": "/static/dora.png",
+    "Doraemon": "/static/doraemon.jpg",
     "Kiteretsu": "/static/kiteretsu.jpg",
-    "Ninja Hattori": "/static/ninja.jpg",
-    "Ninja Hattori Returns": "/static/ninjaReturns.jpg"
+    "Ninja Hattori": "/static/ninja hattori.jpg",
+    "Ninja Hattori Returns": "/static/ninja hattori returns.jpg"
 }
 
 # Initialize Telegram client
@@ -115,7 +115,7 @@ async def shutdown_event():
 async def list_series():
     with open("video.json", encoding="utf-8") as f:
         data = json.load(f)
-    return [{"name": s, "poster": f"/static/{s}.jpg"} for s in data.keys()]
+    return [{"name": s, "poster": POSTERS.get(s, "/static/default.jpg")} for s in data.keys()]
 
 @app.get("/catalog/series/{series_name}")
 async def list_seasons(series_name: str):
