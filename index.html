@@ -1,0 +1,1888 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Smart TV Downloader</title>
+  <script src="$WEBAPIS/webapis/webapis.js"></script>
+  <style>
+    body {
+      background: black;
+      color: white;
+      font-family: sans-serif;
+      margin: 0;
+      padding: 0;
+      overflow: hidden;
+      justify-content: center;
+    }
+
+    .debug {
+      font-size: 18px;
+      color: yellow;
+      padding: 10px;
+      position: absolute;
+      top: 0;
+      left: 0;
+      background: rgba(0, 0, 0, 0.6);
+      z-index: 100;
+    }
+
+    .screen {
+      padding: 40px;
+      height: 100vh;
+      box-sizing: border-box;
+    }
+
+    .title {
+      font-size: 36px;
+      margin-bottom: 20px;
+    }
+
+    /* POSTER Cards */
+    .poster-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+      justify-content: center;
+      overflow-y: auto;
+      max-height: auto;
+    }
+
+    .poster-card {
+      width: 300px;
+      height: 700px;
+      background: #1c1c1c;
+      border: 4px solid transparent;
+      padding: 10px;
+      border-radius: 3px;
+    }
+
+    .poster-card.selected {
+      border-color: white;
+    }
+
+    .poster {
+      width: 100%;
+      height: 650px;
+      object-fit: cover;
+      border-radius: 3px;
+    }
+
+    /* SEASONS */
+    .season-grid {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px;
+      justify-content: center;
+      overflow-y: auto;
+      max-height: none;
+    }
+
+    .season-card {
+      width: 280px;
+      height: 250px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 24px;
+      text-align: center;
+      font-weight: bold;
+      border: 4px solid transparent;
+      color: white;
+      position: relative;
+      overflow: hidden;
+      background-size: cover;
+      background-position: center;
+    }
+
+    .season-card::before {
+      content: "";
+      position: absolute;
+      inset: 0;
+      backdrop-filter: blur(8px);
+      background: rgba(0, 0, 0, 0.4);
+    }
+
+    .season-card span {
+      position: relative;
+      z-index: 1;
+    }
+
+    .season-card.selected {
+      border-color: white;
+    }
+
+    /* EPISODES */
+    .episode-grid {
+      display: flex;
+      flex-direction: column;
+      margin-top: 20px;
+      gap: 20px;
+      overflow-y: auto;
+      max-height: 80vh;
+      padding-right: 20px;
+    }
+
+    .episode-card {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: #333;
+    padding: 16px 24px;
+    border-radius: 6px;
+    font-size: 20px;
+    border: 3px solid transparent;
+    cursor: pointer;
+    }
+
+  .episode-card.selected {
+    border-color: white;
+  }
+
+  .episode-card.selected.button-focused {
+    border-color: transparent;
+  }
+  
+  .episode-card button {
+    background: plum;
+    color: white;
+    border: none;
+    padding: 8px 12px;
+    font-size: 16px;
+    cursor: pointer;
+    border-radius: 4px;
+  }
+  .episode-card button.selected {
+    border: 2px solid white;
+    background: #222;
+  }
+  .episode-card.downloaded {
+  background: #333;
+  }
+
+  .downloaded-label {
+    font-size: 12px;
+    color: #333;
+    font-weight: bold;
+    margin-top: 6px;
+  }
+
+  .downloaded-indicator{
+    position: absolute;
+    bottom: 6px;
+    right: 6px;
+    font-size: 1.2rem;
+  }
+
+  /* Simple Dialog styles */
+  .modal {
+    display: none;
+    position: fixed;
+    z-index: 1000;
+    left: 0;
+    top: 0;
+    width: 100%;
+    height: 100%;
+    background-color: rgba(0, 0, 0, 0.7);
+    align-items: center;
+    justify-content: center;
+  }
+
+  .modal.show {
+    display: flex;
+  }
+
+  .modal-content {
+    background-color: #222;
+    padding: 20px;
+    border-radius: 5px;
+    text-align: center;
+    max-width: 400px;
+    width: 80%;
+    border: 2px solid white;
+  }
+
+  .modal-title {
+    font-size: 20px;
+    margin-bottom: 15px;
+    color: white;
+  }
+
+  .modal-message {
+    font-size: 16px;
+    margin-bottom: 20px;
+    color: #ccc;
+  }
+
+  .modal-buttons {
+    display: flex;
+    justify-content: center;
+    gap: 15px;
+  }
+
+  .modal-button {
+    padding: 10px 20px;
+    font-size: 14px;
+    border: 1px solid white;
+    border-radius: 3px;
+    cursor: pointer;
+    background: transparent;
+    color: white;
+    min-width: 80px;
+  }
+
+  .modal-button.selected {
+    background: white;
+    color: black;
+  }
+
+  /* Video Player Overlay */
+  .video-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    background: transparent;
+    z-index: 2000;
+    display: none;
+    flex-direction: column;
+    pointer-events: none;
+  }
+
+  .video-overlay.show {
+    display: flex;
+  }
+
+  .video-title {
+    position: absolute;
+    top: 20px;
+    left: 20px;
+    font-size: 24px;
+    color: white;
+    background: rgba(0, 0, 0, 0.6);
+    padding: 10px 20px;
+    border-radius: 5px;
+    pointer-events: all;
+    z-index: 2001;
+  }
+
+  .video-controls {
+    position: absolute;
+    bottom: 50px;
+    left: 50%;
+    transform: translateX(-50%);
+    background: rgba(0, 0, 0, 0.8);
+    padding: 20px 30px;
+    border-radius: 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 15px;
+    transition: opacity 0.3s;
+    pointer-events: all;
+    z-index: 2001;
+    min-width: 400px;
+  }
+
+  .video-controls.hidden {
+    opacity: 0;
+  }
+
+  .control-buttons {
+    display: flex;
+    align-items: center;
+    gap: 20px;
+  }
+
+  .control-button {
+    background: rgba(255, 255, 255, 0.2);
+    color: white;
+    border: 2px solid white;
+    padding: 12px 18px;
+    border-radius: 8px;
+    font-size: 18px;
+    cursor: pointer;
+    min-width: 80px;
+    text-align: center;
+  }
+
+  .control-button.selected {
+    background: white;
+    color: black;
+  }
+
+  .progress-container {
+    width: 100%;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .progress-bar {
+    width: 100%;
+    height: 8px;
+    background: rgba(255, 255, 255, 0.3);
+    border-radius: 4px;
+    overflow: hidden;
+    border: 3px solid transparent;
+    cursor: pointer;
+  }
+
+  .progress-bar.selected {
+    border-color: white;
+    background: rgba(255, 255, 255, 0.5);
+  }
+
+  .progress-fill {
+    height: 100%;
+    background: white;
+    width: 0%;
+    transition: width 0.1s;
+  }
+
+  .time-display {
+    color: white;
+    font-size: 14px;
+    text-align: center;
+  }
+
+  /* Audio Track Drawer */
+  .audio-drawer {
+    position: fixed;
+    top: 0;
+    right: -400px;
+    width: 400px;
+    height: 100%;
+    background: rgba(0, 0, 0, 0.9);
+    backdrop-filter: blur(10px);
+    transition: right 0.3s ease;
+    z-index: 2002;
+    padding: 60px 20px 20px 20px;
+    box-sizing: border-box;
+  }
+
+  .audio-drawer.show {
+    right: 0;
+  }
+
+  .audio-drawer-title {
+    font-size: 24px;
+    color: white;
+    margin-bottom: 30px;
+    text-align: center;
+    border-bottom: 2px solid white;
+    padding-bottom: 15px;
+  }
+
+  .audio-track-list {
+    display: flex;
+    flex-direction: column;
+    gap: 15px;
+  }
+
+  .audio-track-item {
+    background: rgba(255, 255, 255, 0.1);
+    color: white;
+    padding: 15px 20px;
+    border-radius: 8px;
+    border: 2px solid transparent;
+    cursor: pointer;
+    font-size: 16px;
+    transition: all 0.2s;
+  }
+
+  .audio-track-item.selected {
+    border-color: white;
+    background: rgba(255, 255, 255, 0.2);
+  }
+
+  .audio-track-item.active {
+    background: white;
+    color: black;
+  }
+
+  .audio-track-item:hover {
+    background: rgba(255, 255, 255, 0.2);
+  }
+  </style>
+</head>
+<body>
+<div class="debug" id="debug">🔌 Loading...</div>
+<div id="app" class="screen"></div>
+
+<!-- Modal for season download confirmation -->
+<div id="confirmModal" class="modal">
+  <div class="modal-content">
+    <div class="modal-title">Download Season?</div>
+    <div class="modal-message" id="modalMessage">Download all episodes?</div>
+    <div class="modal-buttons">
+      <button class="modal-button" id="confirmBtn">Yes</button>
+      <button class="modal-button" id="cancelBtn">No</button>
+    </div>
+  </div>
+</div>
+
+<!-- Video Player Overlay -->
+<div id="videoOverlay" class="video-overlay">
+  <div class="video-title" id="videoTitle">Episode Title</div>
+  <div class="video-controls" id="videoControls">
+    <div class="control-buttons">
+      <button class="control-button" id="playPauseBtn">▶️</button>
+      <button class="control-button" id="audioTrackBtn">🎵</button>
+      <button class="control-button" id="stopBtn">⏹️</button>
+    </div>
+    <div class="progress-container">
+      <div class="progress-bar" id="progressBar">
+        <div class="progress-fill" id="progressFill"></div>
+      </div>
+      <div class="time-display" id="timeDisplay">00:00 / 00:00</div>
+    </div>
+  </div>
+</div>
+
+<!-- Audio Track Drawer -->
+<div id="audioDrawer" class="audio-drawer">
+  <div class="audio-drawer-title">Audio Tracks</div>
+  <div class="audio-track-list" id="audioTrackList">
+    <!-- Audio tracks will be populated here -->
+  </div>
+</div>
+
+<script>
+const SERVER = "http://192.168.0.101:8000";
+const debug = msg => document.getElementById("debug").textContent = msg;
+
+let downloadedMsgIds = new Set();
+
+let state = {
+  view: "landing",
+  seriesList: [],
+  seasonList: [],
+  episodeList: [],
+  selectedSeries: 0,
+  selectedSeason: 0,
+  selectedEpisode: 0,
+  focusMode: "card",
+  modalVisible: false,
+  modalSelectedButton: 0, // 0 for Yes, 1 for No
+  enterKeyPressed: false,
+  enterKeyTimer: null,
+  longPressThreshold: 1000, // 1 second for long press
+  videoPlayer: {
+    visible: false,
+    playing: false,
+    currentTime: 0,
+    duration: 0,
+    selectedControl: 0, // 0=play/pause, 1=audio, 2=stop, 3=progress
+    controlsVisible: true,
+    controlsTimer: null,
+    currentEpisode: null,
+    audioTracks: [],
+    currentAudioTrack: 0,
+    audioDrawerVisible: false,
+    selectedAudioTrack: 0
+  }
+};
+
+async function fetchDownloadedMsgIds() {
+  try {
+    const res = await fetch(`${SERVER}/downloads`);
+    const data = await res.json();
+    downloadedMsgIds = new Set(data.map(file => file.msg_id));
+  } catch (err) {
+    console.error("Failed to fetch downloads:", err);
+  }
+}
+
+async function fetchSeries() {
+  debug("📡 Loading series...");
+  try {
+    const res = await fetch(`${SERVER}/catalog/series`);
+    state.seriesList = await res.json();
+    renderLanding();
+    debug("✅ Series loaded");
+  } catch (e) {
+    debug("❌ Failed to fetch series");
+  }
+}
+
+async function fetchSeasons() {
+  debug("🎞️ Fetching seasons - RESETTING episode state");
+  
+  // CRITICAL: Reset episode state when switching series
+  state.selectedEpisode = 0;
+  state.episodeList = [];
+  state.focusMode = "card";
+  
+  const selected = state.seriesList[state.selectedSeries];
+  const res = await fetch(`${SERVER}/catalog/series/${encodeURIComponent(selected.name)}`);
+  state.seasonList = await res.json();
+  state.selectedSeason = 0;
+  renderSeasons();
+
+}
+
+async function fetchEpisodes() {
+  debug("📺 Fetching episodes - RESETTING episode selection");
+  
+  // CRITICAL: Reset episode selection when switching seasons
+  state.selectedEpisode = 0;
+  state.focusMode = "card";
+  
+  const series = state.seriesList[state.selectedSeries];
+  const season = state.seasonList[state.selectedSeason];
+  const res = await fetch(`${SERVER}/catalog/series/${encodeURIComponent(series.name)}/${encodeURIComponent(season)}`);
+  const episodes = await res.json();
+  state.episodeList = episodes;
+  
+  debug(`📺 Episode state after fetch: selectedEpisode=${state.selectedEpisode}, episodeList.length=${episodes.length}`);
+  return episodes;
+}
+
+
+function renderLanding() {
+  debug("🏠 Rendering landing page - FORCE CLEANUP");
+  
+  // Force stop any video playback with aggressive cleanup
+  if (state.videoPlayer.visible) {
+    stopVideo();
+  }
+  
+  // Additional aggressive cleanup regardless of state
+  if (typeof webapis !== 'undefined' && webapis.avplay) {
+    try {
+      const currentState = webapis.avplay.getState();
+      debug("🏠 AVPlay state before landing: " + currentState);
+      if (currentState !== "NONE" && currentState !== "IDLE") {
+        debug("⚠️ WARNING: AVPlay not clean! Forcing cleanup...");
+        try {
+          webapis.avplay.stop();
+          webapis.avplay.close();
+          debug("🏠 Forced AVPlay cleanup completed");
+        } catch (forceError) {
+          debug("🏠 Force cleanup error: " + forceError.message);
+        }
+      }
+    } catch (stateError) {
+      debug("🏠 AVPlay state check error (likely clean): " + stateError.message);
+    }
+  }
+  
+  // Remove any lingering AVPlay object
+  if (avplayObj) {
+    debug("⚠️ WARNING: AVPlay object still exists! Removing...");
+    try {
+      avplayObj.remove();
+      avplayObj = null;
+      debug("🏠 Lingering AVPlay object removed");
+    } catch (e) {
+      debug("🏠 Error removing lingering AVPlay object: " + e.message);
+    }
+  }
+  
+  // CRITICAL: Reset all navigation state when returning to landing
+  state.view = "landing";
+  state.selectedSeason = 0;
+  state.selectedEpisode = 0;
+  state.seasonList = [];
+  state.episodeList = [];
+  state.focusMode = "card";
+  debug("🏠 Navigation state completely reset: season=0, episode=0, lists cleared");
+  
+  const app = document.getElementById("app");
+  const cards = state.seriesList.map((s, i) => `
+    <div class="poster-card ${i === state.selectedSeries ? 'selected' : ''}">
+      <img class="poster" src="${SERVER}${s.poster}" />
+      <div style="margin-top:10px; font-size:22px; text-align:center;">${s.name}</div>
+    </div>
+  `).join("");
+  app.innerHTML = `
+    <div class="title">📺 Select Series</div>
+    <div class="poster-grid">${cards}</div>
+  `;
+  
+  debug("🏠 Landing page rendered successfully");
+}
+
+function renderSeasons() {
+  debug("🎞️ Rendering seasons page - FORCE CLEANUP");
+  
+  // Force stop any video playback with aggressive cleanup
+  if (state.videoPlayer.visible) {
+    stopVideo();
+  }
+  
+  // Additional aggressive cleanup regardless of state
+  if (typeof webapis !== 'undefined' && webapis.avplay) {
+    try {
+      const currentState = webapis.avplay.getState();
+      debug("🎞️ AVPlay state before seasons: " + currentState);
+      if (currentState !== "NONE" && currentState !== "IDLE") {
+        debug("⚠️ WARNING: AVPlay not clean! Forcing cleanup...");
+        try {
+          webapis.avplay.stop();
+          webapis.avplay.close();
+          debug("🎞️ Forced AVPlay cleanup completed");
+        } catch (forceError) {
+          debug("🎞️ Force cleanup error: " + forceError.message);
+        }
+      }
+    } catch (stateError) {
+      debug("🎞️ AVPlay state check error (likely clean): " + stateError.message);
+    }
+  }
+  
+  // Remove any lingering AVPlay object
+  if (avplayObj) {
+    debug("⚠️ WARNING: AVPlay object still exists! Removing...");
+    try {
+      avplayObj.remove();
+      avplayObj = null;
+      debug("🎞️ Lingering AVPlay object removed");
+    } catch (e) {
+      debug("🎞️ Error removing lingering AVPlay object: " + e.message);
+    }
+  }
+  
+  state.view = "seasons";
+  const app = document.getElementById("app");
+  const series = state.seriesList[state.selectedSeries];
+  const posterURL = `${SERVER}${series.poster}`;
+  
+  app.innerHTML = `
+    <div class="title">🎞️ ${series.name}</div>
+    <div class="season-grid" id="season-grid"></div>
+  `;
+  
+  const seasonGrid = document.getElementById("season-grid");
+  
+  state.seasonList.forEach((season, i) => {
+    const seasonCard = document.createElement("div");
+    seasonCard.className = `season-card ${i === state.selectedSeason ? 'selected' : ''}`;
+    seasonCard.innerHTML = `<span>${season}</span>`;
+    
+    // Add long press detection
+    let longPressTimer = null;
+    let longPressActive = false;
+    
+    seasonCard.addEventListener('mousedown', () => {
+      longPressActive = false;
+      longPressTimer = setTimeout(() => {
+        longPressActive = true;
+        state.selectedSeason = i;
+        showSeasonDownloadModal();
+      }, 1000); // 1 second long press
+    });
+    
+    seasonCard.addEventListener('mouseup', () => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+      
+      if (!longPressActive) {
+        // Regular click - navigate to episodes
+        state.selectedSeason = i;
+        state.focusMode = "card";
+        renderEpisodes();
+      }
+    });
+    
+    seasonCard.addEventListener('mouseleave', () => {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+      longPressActive = false;
+    });
+    
+    seasonGrid.appendChild(seasonCard);
+  });
+}
+
+async function renderEpisodes() {
+  debug("🎬 Rendering episodes page - FORCE CLEANUP");
+  
+  // Force stop any video playback with aggressive cleanup
+  if (state.videoPlayer.visible) {
+    stopVideo();
+  }
+  
+  // Additional aggressive cleanup regardless of state
+  if (typeof webapis !== 'undefined' && webapis.avplay) {
+    try {
+      const currentState = webapis.avplay.getState();
+      debug("🎬 AVPlay state before episodes: " + currentState);
+      if (currentState !== "NONE" && currentState !== "IDLE") {
+        debug("⚠️ WARNING: AVPlay not clean! Forcing cleanup...");
+        try {
+          webapis.avplay.stop();
+          webapis.avplay.close();
+          debug("🎬 Forced AVPlay cleanup completed");
+        } catch (forceError) {
+          debug("🎬 Force cleanup error: " + forceError.message);
+        }
+      }
+    } catch (stateError) {
+      debug("🎬 AVPlay state check error (likely clean): " + stateError.message);
+    }
+  }
+  
+  // Remove any lingering AVPlay object
+  if (avplayObj) {
+    debug("⚠️ WARNING: AVPlay object still exists! Removing...");
+    try {
+      avplayObj.remove();
+      avplayObj = null;
+      debug("🎬 Lingering AVPlay object removed");
+    } catch (e) {
+      debug("🎬 Error removing lingering AVPlay object: " + e.message);
+    }
+  }
+  
+  const container = document.getElementById("app");
+  state.view = "episodes";
+  // Don't reset focusMode here, keep the current focus mode
+
+  await fetchDownloadedMsgIds(); // Ensure downloadedMsgIds is up to date
+  const episodes = await fetchEpisodes();
+
+  container.innerHTML = `
+    <div class="title">🎬 Episodes</div>
+    <div class="episode-grid" id="episode-list"></div>
+  `;
+
+  const list = document.getElementById("episode-list");
+
+  episodes.forEach((ep, i) => {
+    const isSelected = i === state.selectedEpisode;
+    const isDownloaded = downloadedMsgIds.has(String(ep.msg_id));
+
+    const card = document.createElement("div");
+    card.className = "episode-card" + 
+                     (isSelected ? " selected" : "") + 
+                     (isDownloaded ? " downloaded" : "");
+    card.tabIndex = 0;
+
+    // Add click handler to the card
+    card.onclick = () => {
+      debug(`🎬 Card clicked for episode ${i}: ${ep.title}`);
+      debug(`🎬 Current state: selectedEpisode=${state.selectedEpisode}, episodeList.length=${state.episodeList.length}`);
+      
+      // CRITICAL: Update selected episode before triggering action
+      state.selectedEpisode = i;
+      debug(`🎬 Updated selectedEpisode to ${i} before action`);
+      
+      if (isDownloaded) {
+        playVideo(ep);
+      } else {
+        // Trigger download if not downloaded
+        downloadEpisode(i);
+      }
+    };
+
+    card.innerHTML = `
+      <div>${ep.title}</div>
+    `;
+
+    if (!isDownloaded) {
+      const downloadBtn = document.createElement("button");
+      downloadBtn.className = "download-btn";
+      downloadBtn.textContent = "⬇️";
+      downloadBtn.onclick = (e) => {
+        e.stopPropagation(); // Prevent card click from triggering
+        debug(`🎬 Download button clicked for episode ${i}: ${ep.title}`);
+        debug(`🎬 Current state: selectedEpisode=${state.selectedEpisode}, episodeList.length=${state.episodeList.length}`);
+        
+        // CRITICAL: Update selected episode before triggering download
+        state.selectedEpisode = i;
+        debug(`🎬 Updated selectedEpisode to ${i} before download`);
+        
+        downloadEpisode(i);
+      };
+
+      // Apply button focus styling based on current focus mode
+      if (state.focusMode === "button" && isSelected) {
+        downloadBtn.classList.add("selected");
+      }
+
+      card.appendChild(downloadBtn);
+    } else {
+      // const label = document.createElement("div");
+      // label.className = "downloaded-indicator";
+      // label.textContent = "📥";
+      // card.appendChild(label);
+    }
+
+    list.appendChild(card);
+  });
+
+  scrollIntoViewIfNeeded(".episode-grid", state.selectedEpisode);
+}
+
+function updateEpisodeFocus() {
+  const list = document.getElementById("episode-list");
+  if (!list) return;
+
+  // Update all episode cards
+  Array.from(list.children).forEach((card, i) => {
+    const isSelected = i === state.selectedEpisode;
+    const isDownloaded = downloadedMsgIds.has(String(state.episodeList[i].msg_id));
+    
+    // Update card selection
+    if (isSelected) {
+      card.classList.add("selected");
+      // If button is focused, remove card focus border
+      if (state.focusMode === "button") {
+        card.classList.add("button-focused");
+      } else {
+        card.classList.remove("button-focused");
+      }
+    } else {
+      card.classList.remove("selected", "button-focused");
+    }
+    
+    // Update button focus if card has a download button
+    const downloadBtn = card.querySelector(".download-btn");
+    if (downloadBtn) {
+      if (state.focusMode === "button" && isSelected) {
+        downloadBtn.classList.add("selected");
+      } else {
+        downloadBtn.classList.remove("selected");
+      }
+    }
+  });
+}
+
+function showSeasonDownloadModal() {
+  debug(`🎯 Show season download modal: selectedSeries=${state.selectedSeries}, selectedSeason=${state.selectedSeason}`);
+  debug(`🎯 Series list length: ${state.seriesList.length}, Season list length: ${state.seasonList.length}`);
+  
+  // CRITICAL: Validate series and season selection
+  if (state.selectedSeries < 0 || state.selectedSeries >= state.seriesList.length) {
+    debug(`❌ ERROR: Invalid series selection ${state.selectedSeries} for modal! seriesList.length=${state.seriesList.length}`);
+    return;
+  }
+  
+  if (state.selectedSeason < 0 || state.selectedSeason >= state.seasonList.length) {
+    debug(`❌ ERROR: Invalid season selection ${state.selectedSeason} for modal! seasonList.length=${state.seasonList.length}`);
+    return;
+  }
+  
+  const series = state.seriesList[state.selectedSeries];
+  const season = state.seasonList[state.selectedSeason];
+  
+  debug(`🎯 Modal for series: ${series.name}, season: ${season}`);
+  
+  document.getElementById("modalMessage").textContent = 
+    `Download all episodes from ${season}?`;
+  
+  const modal = document.getElementById("confirmModal");
+  modal.classList.add("show");
+  state.modalVisible = true;
+  state.modalSelectedButton = 0; // Default to "Yes"
+  updateModalButtons();
+}
+
+function hideSeasonDownloadModal() {
+  const modal = document.getElementById("confirmModal");
+  modal.classList.remove("show");
+  state.modalVisible = false;
+}
+
+function updateModalButtons() {
+  const confirmBtn = document.getElementById("confirmBtn");
+  const cancelBtn = document.getElementById("cancelBtn");
+  
+  if (state.modalSelectedButton === 0) {
+    confirmBtn.classList.add("selected");
+    cancelBtn.classList.remove("selected");
+  } else {
+    confirmBtn.classList.remove("selected");
+    cancelBtn.classList.add("selected");
+  }
+}
+
+async function downloadWholeSeason() {
+  debug(`⬇️ Download whole season: selectedSeason=${state.selectedSeason}, seasonList.length=${state.seasonList.length}`);
+  
+  // CRITICAL: Validate season selection
+  if (state.selectedSeason < 0 || state.selectedSeason >= state.seasonList.length) {
+    debug(`❌ ERROR: Invalid season selection ${state.selectedSeason} for download! seasonList.length=${state.seasonList.length}`);
+    return;
+  }
+  
+  const season = state.seasonList[state.selectedSeason];
+  debug(`⬇️ Downloading season: ${season}`);
+  
+  try {
+    // Fetch all episodes for the season
+    const episodes = await fetchEpisodes();
+    let downloadCount = 0;
+    
+    // Download each episode that's not already downloaded
+    for (const ep of episodes) {
+      const isDownloaded = downloadedMsgIds.has(String(ep.msg_id));
+      if (!isDownloaded) {
+        downloadCount++;
+        fetch(`${SERVER}/download?url=${encodeURIComponent(ep.url)}`)
+          .catch(err => {
+            debug(`❌ Error: ${err.message}`);
+          });
+      }
+    }
+    
+    debug(`✅ Started downloading ${downloadCount} episodes`);
+  } catch (error) {
+    debug("❌ Failed: " + error.message);
+  }
+}
+
+let avplayObj = null;
+let playerStateMonitor = null;
+
+function playVideo(episode) {
+  debug(`🎬 Starting video playback for episode: ${episode.title} (msg_id: ${episode.msg_id})`);
+  debug(`🎬 Current episode list length: ${state.episodeList.length}, selectedEpisode: ${state.selectedEpisode}`);
+  
+  // CRITICAL: Validate that the episode belongs to the current episode list
+  const currentEpisodeIndex = state.episodeList.findIndex(ep => ep.msg_id === episode.msg_id);
+  if (currentEpisodeIndex === -1) {
+    debug(`❌ ERROR: Episode ${episode.title} not found in current episode list! This is a stale episode.`);
+    return;
+  }
+  
+  debug(`🎬 Episode validated: ${episode.title} is at index ${currentEpisodeIndex} in current episode list`);
+  
+  if (typeof webapis === 'undefined' || !webapis.avplay) {
+    debug("❌ AVPlay not available");
+    return;
+  }
+
+  // AGGRESSIVE CLEANUP before starting new video
+  debug("🧹 Performing aggressive cleanup before new video");
+  
+  // Force stop any existing video playback first
+  if (state.videoPlayer.visible) {
+    stopVideo();
+  }
+  
+  // Additional aggressive cleanup regardless of state
+  if (typeof webapis !== 'undefined' && webapis.avplay) {
+    try {
+      const currentState = webapis.avplay.getState();
+      debug("🎬 AVPlay state before new video: " + currentState);
+      if (currentState !== "NONE" && currentState !== "IDLE") {
+        debug("⚠️ WARNING: AVPlay not clean before new video! Forcing cleanup...");
+        try {
+          webapis.avplay.stop();
+          webapis.avplay.close();
+          debug("🎬 Forced AVPlay cleanup completed");
+        } catch (forceError) {
+          debug("🎬 Force cleanup error: " + forceError.message);
+        }
+      }
+    } catch (stateError) {
+      debug("🎬 AVPlay state check error (likely clean): " + stateError.message);
+    }
+  }
+  
+  // Remove any lingering AVPlay object
+  if (avplayObj) {
+    debug("⚠️ WARNING: AVPlay object still exists before new video! Removing...");
+    try {
+      avplayObj.remove();
+      avplayObj = null;
+      debug("🎬 Lingering AVPlay object removed");
+    } catch (e) {
+      debug("🎬 Error removing lingering AVPlay object: " + e.message);
+    }
+  }
+  
+  // Small delay to ensure cleanup completes
+  setTimeout(() => {
+    debug("🎬 Cleanup completed, checking video file...");
+    
+    // Check if video file exists on server first - try direct URL first
+    fetch(`${SERVER}/stream_direct/${episode.msg_id}`)
+      .then(response => response.json())
+      .then(data => {
+        debug("✅ Direct PixelDrain URL available");
+        startVideoPlayback(episode);
+      })
+      .catch(error => {
+        debug("⚠️ Direct URL not available, checking proxied stream...");
+        // Fallback to checking proxied stream
+        fetch(`${SERVER}/stream_local/${episode.msg_id}`, { method: 'HEAD' })
+          .then(checkResponse => {
+            if (!checkResponse.ok) {
+              debug("❌ Video file not accessible: " + checkResponse.status);
+              return;
+            }
+            debug("✅ Video file accessible via proxy, size: " + checkResponse.headers.get('content-length'));
+            startVideoPlayback(episode);
+          })
+          .catch(error => {
+            debug("❌ Error checking video file: " + error.message);
+          });
+      });
+  }, 300); // Delay to ensure cleanup completes
+}
+
+function startVideoPlayback(episode) {
+  debug("🎬 Starting video playback for: " + episode.title);
+  
+  try {
+    // Ensure we have a clean state before starting
+    debug("🧹 Final cleanup check before starting playback");
+    
+    // Clear any existing state monitor
+    if (playerStateMonitor) {
+      clearInterval(playerStateMonitor);
+      playerStateMonitor = null;
+    }
+    
+    // Verify AVPlay is in clean state
+    const avplayInstance = webapis.avplay;
+    try {
+      const currentState = avplayInstance.getState();
+      debug("🎬 AVPlay state at start: " + currentState);
+      if (currentState !== "NONE" && currentState !== "IDLE") {
+        debug("⚠️ WARNING: AVPlay not in clean state at start! Current state: " + currentState);
+        // Force clean state
+        try {
+          avplayInstance.stop();
+          avplayInstance.close();
+          debug("🎬 Forced AVPlay to clean state");
+        } catch (cleanError) {
+          debug("🎬 Clean state error: " + cleanError.message);
+        }
+      }
+    } catch (stateError) {
+      debug("🎬 AVPlay state check error (likely clean): " + stateError.message);
+    }
+    
+    // Ensure no lingering AVPlay object exists
+    if (avplayObj) {
+      debug("⚠️ WARNING: AVPlay object exists at start! Removing...");
+      try {
+        avplayObj.remove();
+        avplayObj = null;
+      } catch (e) {
+        debug("🎬 Error removing object: " + e.message);
+      }
+    }
+    
+    state.videoPlayer.currentEpisode = episode;
+    
+    // Try to get direct PixelDrain URL first, fallback to proxied stream
+    debug("🔗 Getting streaming URL for episode...");
+    fetch(`${SERVER}/stream_direct/${episode.msg_id}`)
+      .then(response => response.json())
+      .then(data => {
+        const videoUrl = data.direct_url;
+        debug("🔗 Using direct PixelDrain URL: " + videoUrl);
+        playVideoWithUrl(episode, videoUrl);
+      })
+      .catch(error => {
+        debug("⚠️ Failed to get direct URL, using proxied stream: " + error.message);
+        const videoUrl = `${SERVER}/stream_local/${episode.msg_id}`;
+        debug("🔗 Using proxied URL: " + videoUrl);
+        playVideoWithUrl(episode, videoUrl);
+      });
+      
+  } catch (error) {
+    debug("❌ Error in startVideoPlayback: " + error.message);
+    console.error("Video playback error:", error);
+  }
+}
+
+function playVideoWithUrl(episode, videoUrl) {
+  debug("🎬 Playing: " + episode.title);
+  debug("🔗 Video URL: " + videoUrl);
+  
+  // Show overlay for controls and title
+  document.getElementById("videoTitle").textContent = episode.title;
+  document.getElementById("videoOverlay").classList.add("show");
+  state.videoPlayer.visible = true;
+  state.videoPlayer.selectedControl = 0;
+  state.videoPlayer.playing = true;
+  
+  showVideoControls();
+  updateVideoControls();
+  
+  // Create AVPlay object element for video display
+  const obj = document.createElement('object');
+  obj.setAttribute('type', 'application/avplayer');
+  obj.style.position = 'fixed';
+  obj.style.left = '0px';
+  obj.style.top = '0px';
+  obj.style.width = '100%';
+  obj.style.height = '100%';
+  obj.style.zIndex = '1000'; // Behind controls and title
+  obj.style.backgroundColor = 'black';
+  document.body.appendChild(obj);
+  avplayObj = obj;
+  
+  const avplayPlayer = webapis.avplay;
+  
+  // Close any existing playback
+  try { avplayPlayer.close(); } catch (_) {}
+    
+  // Open the video URL
+  avplayPlayer.open(videoUrl);
+  
+  // Set display method to letterbox to maintain aspect ratio
+  avplayPlayer.setDisplayMethod("PLAYER_DISPLAY_MODE_LETTER_BOX");
+  
+  // Set up event listeners with detailed error handling
+  avplayPlayer.setListener({
+    onbufferingstart: () => {
+      debug("🔄 Buffering...");
+    },
+    onbufferingcomplete: () => {
+      debug("✅ Buffering complete");
+    },
+    oncurrentplaytime: (currentTime) => {
+      state.videoPlayer.currentTime = currentTime / 1000; // Convert to seconds
+      updateVideoProgress();
+    },
+    onstreamcompleted: () => {
+      debug("✅ Video completed normally");
+      stopVideo();
+    },
+    onerror: (error) => {
+      debug("❌ AVPlay error: " + JSON.stringify(error));
+      console.error("AVPlay error details:", error);
+      stopVideo();
+    },
+    onsubtitlechange: (duration, text, type) => {
+      debug("📝 Subtitle: " + text);
+    },
+    onstatechange: (state) => {
+      debug("🔄 Player state: " + state);
+    },
+    ondrmevent: (drmEvent, drmData) => {
+      debug("🔐 DRM event: " + drmEvent);
+    }
+  });
+  
+  // Prepare and play with better error handling
+  avplayPlayer.prepareAsync(() => {
+    try {
+      debug("🎬 Video prepared successfully");
+      
+      // Set display rect after video is prepared to get proper dimensions
+      avplayPlayer.setDisplayRect(0, 0, window.innerWidth, window.innerHeight);
+      
+      // Start playback
+      avplayPlayer.play();
+      
+      // Get video duration
+      const duration = avplayPlayer.getDuration();
+      state.videoPlayer.duration = duration / 1000; // Convert to seconds
+      debug(`📏 Video duration: ${state.videoPlayer.duration}s`);
+      
+      // Get audio tracks
+      try {
+        const audioTracks = avplayPlayer.getTotalTrackInfo();
+        state.videoPlayer.audioTracks = audioTracks.filter(track => track.type === 'AUDIO');
+        state.videoPlayer.currentAudioTrack = 0;
+        populateAudioTracks();
+        debug(`🎵 Found ${state.videoPlayer.audioTracks.length} audio tracks`);
+      } catch (e) {
+        debug("🎵 No audio tracks info available: " + e.message);
+        state.videoPlayer.audioTracks = [];
+      }
+      
+      updatePlayPauseButton();
+      debug("▶️ Video playback started");
+      
+      // Start monitoring player state
+      playerStateMonitor = setInterval(() => {
+        try {
+          const currentState = avplayPlayer.getState();
+          if (currentState === "NONE" || currentState === "IDLE") {
+            debug("⚠️ Player unexpectedly stopped, state: " + currentState);
+            stopVideo();
+          }
+        } catch (e) {
+          debug("⚠️ Error monitoring player state: " + e.message);
+          stopVideo();
+        }
+      }, 2000); // Check every 2 seconds
+      
+    } catch (error) {
+      debug("❌ Error in prepare callback: " + error.message);
+      stopVideo();
+    }
+  }, (error) => {
+    debug("❌ Failed to prepare video: " + JSON.stringify(error));
+    console.error("Prepare error details:", error);
+    stopVideo();
+  });
+  
+  try {
+    // Additional error handling for video playback
+  } catch (error) {
+    debug("❌ Error playing video: " + error.message);
+    stopVideo();
+  }
+}
+
+function togglePlayPause() {
+  if (typeof webapis === 'undefined' || !webapis.avplay) return;
+  
+  try {
+    const avplayController = webapis.avplay;
+    const currentState = avplayController.getState();
+    
+    if (currentState === "PLAYING") {
+      avplayController.pause();
+      state.videoPlayer.playing = false;
+      debug("⏸️ Paused");
+    } else if (currentState === "PAUSED") {
+      avplayController.play();
+      state.videoPlayer.playing = true;
+      debug("▶️ Playing");
+    } else {
+      debug("⛔ Invalid state: " + currentState);
+    }
+    updatePlayPauseButton();
+  } catch (error) {
+    debug("❌ Error toggling play/pause: " + error.message);
+  }
+}
+
+function seekVideo(seconds) {
+  if (typeof webapis === 'undefined' || !webapis.avplay) return;
+  
+  try {
+    const avplaySeeker = webapis.avplay;
+    const currentState = avplaySeeker.getState();
+    
+    if (currentState === "PLAYING" || currentState === "PAUSED") {
+      const seekMs = seconds * 1000; // Convert to milliseconds
+      if (seconds > 0) {
+        avplaySeeker.jumpForward(Math.abs(seekMs));
+        debug(`⏩ Forward ${Math.abs(seconds)}s`);
+      } else {
+        avplaySeeker.jumpBackward(Math.abs(seekMs));
+        debug(`⏪ Backward ${Math.abs(seconds)}s`);
+      }
+    }
+  } catch (error) {
+    debug("❌ Error seeking: " + error.message);
+  }
+}
+
+function stopVideo() {
+  debug("🛑 Stopping video playback - AGGRESSIVE CLEANUP");
+  
+  // Clear state monitor
+  if (playerStateMonitor) {
+    clearInterval(playerStateMonitor);
+    playerStateMonitor = null;
+    debug("🛑 State monitor cleared");
+  }
+  
+  // Clear controls timer
+  if (state.videoPlayer.controlsTimer) {
+    clearTimeout(state.videoPlayer.controlsTimer);
+    state.videoPlayer.controlsTimer = null;
+    debug("🛑 Controls timer cleared");
+  }
+  
+  if (typeof webapis !== 'undefined' && webapis.avplay) {
+    const avplayStopper = webapis.avplay;
+    
+    try {
+      const currentState = avplayStopper.getState();
+      debug("🛑 Current player state before cleanup: " + currentState);
+      
+      // Force stop regardless of current state
+      try {
+        avplayStopper.stop();
+        debug("🛑 Player force stopped");
+      } catch (stopError) {
+        debug("⚠️ Stop error (continuing): " + stopError.message);
+      }
+      
+      // Force close regardless of current state
+      try {
+        avplayStopper.close();
+        debug("🛑 Player force closed");
+      } catch (closeError) {
+        debug("⚠️ Close error (continuing): " + closeError.message);
+      }
+      
+      // Additional cleanup - try to reset all listeners
+      try {
+        avplayStopper.setListener({
+          onbufferingstart: null,
+          onbufferingcomplete: null,
+          oncurrentplaytime: null,
+          onstreamcompleted: null,
+          onerror: null,
+          onsubtitlechange: null,
+          onstatechange: null,
+          ondrmevent: null
+        });
+        debug("🛑 All listeners cleared");
+      } catch (listenerError) {
+        debug("⚠️ Listener clear error (continuing): " + listenerError.message);
+      }
+      
+      // Verify final state
+      try {
+        const finalState = avplayStopper.getState();
+        debug("🛑 Final player state after cleanup: " + finalState);
+      } catch (stateError) {
+        debug("🛑 Player state check failed (good - likely fully reset): " + stateError.message);
+      }
+      
+    } catch (error) {
+      debug("❌ Error during AVPlay cleanup: " + error.message);
+      console.error("Stop error details:", error);
+    }
+  }
+  
+  // Remove the AVPlay object element with additional cleanup
+  if (avplayObj) {
+    try {
+      avplayObj.style.display = 'none';
+      avplayObj.remove();
+      avplayObj = null;
+      debug("🛑 AVPlay object removed and nullified");
+    } catch (objError) {
+      debug("⚠️ AVPlay object removal error: " + objError.message);
+      avplayObj = null;
+    }
+  }
+  
+  // Hide video overlay
+  document.getElementById("videoOverlay").classList.remove("show");
+  
+  // Reset video player state completely
+  state.videoPlayer = {
+    visible: false,
+    playing: false,
+    currentTime: 0,
+    duration: 0,
+    selectedControl: 0,
+    controlsVisible: true,
+    controlsTimer: null,
+    currentEpisode: null,
+    audioTracks: [],
+    currentAudioTrack: 0,
+    audioDrawerVisible: false,
+    selectedAudioTrack: 0
+  };
+  
+  // Hide audio drawer if open
+  hideAudioDrawer();
+  
+  debug("⏹️ Video playback COMPLETELY stopped and ALL state reset");
+}
+
+function showVideoControls() {
+  const controls = document.getElementById("videoControls");
+  controls.classList.remove("hidden");
+  state.videoPlayer.controlsVisible = true;
+  
+  // Auto-hide controls after 3 seconds
+  if (state.videoPlayer.controlsTimer) {
+    clearTimeout(state.videoPlayer.controlsTimer);
+  }
+  state.videoPlayer.controlsTimer = setTimeout(() => {
+    controls.classList.add("hidden");
+    state.videoPlayer.controlsVisible = false;
+  }, 3000);
+}
+
+function updatePlayPauseButton() {
+  const btn = document.getElementById("playPauseBtn");
+  btn.textContent = state.videoPlayer.playing ? "⏸️" : "▶️";
+}
+
+function updateVideoControls() {
+  const buttons = ["playPauseBtn", "audioTrackBtn", "stopBtn"];
+  const progressBar = document.getElementById("progressBar");
+  
+  // Update button selection
+  buttons.forEach((btnId, index) => {
+    const btn = document.getElementById(btnId);
+    if (index === state.videoPlayer.selectedControl) {
+      btn.classList.add("selected");
+    } else {
+      btn.classList.remove("selected");
+    }
+  });
+  
+  // Update progress bar selection
+  if (state.videoPlayer.selectedControl === 3) {
+    progressBar.classList.add("selected");
+  } else {
+    progressBar.classList.remove("selected");
+  }
+}
+
+function updateVideoProgress() {
+  const progress = (state.videoPlayer.currentTime / state.videoPlayer.duration) * 100;
+  document.getElementById("progressFill").style.width = progress + "%";
+  
+  const currentTimeStr = formatTime(state.videoPlayer.currentTime);
+  const durationStr = formatTime(state.videoPlayer.duration);
+  document.getElementById("timeDisplay").textContent = `${currentTimeStr} / ${durationStr}`;
+}
+
+function formatTime(seconds) {
+  const minutes = Math.floor(seconds / 60);
+  const remainingSeconds = Math.floor(seconds % 60);
+  return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
+}
+
+function downloadEpisode(index) {
+  debug(`⬇️ Download requested for index ${index}, episodeList.length=${state.episodeList.length}`);
+  
+  // CRITICAL: Validate episode index is within bounds
+  if (index < 0 || index >= state.episodeList.length) {
+    debug(`❌ ERROR: Invalid episode index ${index} for download! episodeList.length=${state.episodeList.length}`);
+    return;
+  }
+  
+  const ep = state.episodeList[index];
+  debug(`⬇️ Downloading episode: ${ep.title} (index ${index})`);
+  
+  fetch(`${SERVER}/download?url=${encodeURIComponent(ep.url)}`)
+    .then(res => {
+      if (res.ok) debug("✅ Download started");
+      else debug("❌ Download failed");
+    })
+    .catch(err => debug("❌ Error: " + err.message));
+}
+
+function goBack() {
+  debug("🔙 Go Back called: " + state.view + " - FORCE CLEANUP");
+  
+  // Always stop any active video playback when navigating with aggressive cleanup
+  if (state.videoPlayer.visible) {
+    stopVideo();
+  }
+  
+  // Additional aggressive cleanup regardless of state
+  if (typeof webapis !== 'undefined' && webapis.avplay) {
+    try {
+      const currentState = webapis.avplay.getState();
+      debug("🔙 AVPlay state during goBack: " + currentState);
+      if (currentState !== "NONE" && currentState !== "IDLE") {
+        debug("⚠️ WARNING: AVPlay not clean during goBack! Forcing cleanup...");
+        try {
+          webapis.avplay.stop();
+          webapis.avplay.close();
+          debug("🔙 Forced AVPlay cleanup completed");
+        } catch (forceError) {
+          debug("🔙 Force cleanup error: " + forceError.message);
+        }
+      }
+    } catch (stateError) {
+      debug("🔙 AVPlay state check error (likely clean): " + stateError.message);
+    }
+  }
+  
+  // Remove any lingering AVPlay object
+  if (avplayObj) {
+    debug("⚠️ WARNING: AVPlay object still exists during goBack! Removing...");
+    try {
+      avplayObj.remove();
+      avplayObj = null;
+      debug("🔙 Lingering AVPlay object removed");
+    } catch (e) {
+      debug("🔙 Error removing lingering AVPlay object: " + e.message);
+    }
+  }
+  
+  if (state.view === "episodes") {
+    debug("🔙 Going back to seasons - RESETTING episode state");
+    state.selectedEpisode = 0;
+    state.episodeList = [];
+    state.focusMode = "card"; // Reset focus mode when going back
+    renderSeasons();
+  } else if (state.view === "seasons") {
+    debug("🔙 Going back to landing - RESETTING season/episode state");
+    state.selectedSeason = 0;
+    state.selectedEpisode = 0;
+    state.seasonList = [];
+    state.episodeList = [];
+    state.focusMode = "card";
+    renderLanding();
+  }
+}
+
+function scrollIntoViewIfNeeded(containerSelector, index) {
+  const container = document.querySelector(containerSelector);
+  if (!container) return;
+  const item = container.children[index];
+  if (item) item.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+}
+
+function handleKey(code) {
+  debug("key: " + code);
+  
+  // Handle video player controls
+  if (state.videoPlayer.visible) {
+    showVideoControls(); // Show controls on any key press
+    
+    // Handle audio drawer navigation
+    if (state.videoPlayer.audioDrawerVisible) {
+      if (code === 38) { // Up arrow
+        state.videoPlayer.selectedAudioTrack = Math.max(0, state.videoPlayer.selectedAudioTrack - 1);
+        updateAudioTrackSelection();
+      } else if (code === 40) { // Down arrow
+        state.videoPlayer.selectedAudioTrack = Math.min(state.videoPlayer.audioTracks.length - 1, state.videoPlayer.selectedAudioTrack + 1);
+        updateAudioTrackSelection();
+      } else if (code === 13) { // Enter
+        selectAudioTrack(state.videoPlayer.selectedAudioTrack);
+      } else if (code === 10009 || code === 37) { // Back or Left arrow
+        hideAudioDrawer();
+      }
+      return;
+    }
+    
+    if (code === 37) { // Left arrow
+      if (state.videoPlayer.selectedControl === 3) {
+        // Rewind when on progress bar
+        seekFromProgressBar(-1);
+      } else {
+        state.videoPlayer.selectedControl = Math.max(0, state.videoPlayer.selectedControl - 1);
+        updateVideoControls();
+      }
+    } else if (code === 39) { // Right arrow
+      if (state.videoPlayer.selectedControl === 3) {
+        // Forward when on progress bar
+        seekFromProgressBar(1);
+      } else {
+        state.videoPlayer.selectedControl = Math.min(3, state.videoPlayer.selectedControl + 1);
+        updateVideoControls();
+      }
+    } else if (code === 38) { // Up arrow
+      if (state.videoPlayer.selectedControl === 3) {
+        // Move from progress bar to buttons
+        state.videoPlayer.selectedControl = 1; // Audio button
+        updateVideoControls();
+      }
+    } else if (code === 40) { // Down arrow
+      if (state.videoPlayer.selectedControl < 3) {
+        // Move from buttons to progress bar
+        state.videoPlayer.selectedControl = 3;
+        updateVideoControls();
+      }
+    } else if (code === 13) { // Enter
+      switch (state.videoPlayer.selectedControl) {
+        case 0: // Play/Pause
+          togglePlayPause();
+          break;
+        case 1: // Audio Track
+          if (state.videoPlayer.audioTracks.length > 0) {
+            showAudioDrawer();
+          } else {
+            debug("🎵 No audio tracks available");
+          }
+          break;
+        case 2: // Stop
+          stopVideo();
+          break;
+        case 3: // Progress bar
+          // Could implement seek to position here
+          break;
+      }
+    } else if (code === 10009) { // Back button
+      stopVideo();
+    } else if (code === 417) { // Fast forward
+      seekVideo(30);
+    } else if (code === 412) { // Rewind
+      seekVideo(-30);
+    } else if (code === 19) { // Pause button
+      if (state.videoPlayer.playing) togglePlayPause();
+    } else if (code === 415) { // Play button
+      if (!state.videoPlayer.playing) togglePlayPause();
+    }
+    return;
+  }
+  
+  // Handle modal navigation
+  if (state.modalVisible) {
+    if (code === 37) { // Left arrow
+      state.modalSelectedButton = 0; // Yes
+      updateModalButtons();
+    } else if (code === 39) { // Right arrow
+      state.modalSelectedButton = 1; // No
+      updateModalButtons();
+    } else if (code === 13) { // Enter
+      if (state.modalSelectedButton === 0) {
+        // Yes - download whole season
+        hideSeasonDownloadModal();
+        downloadWholeSeason();
+      } else {
+        // No - cancel
+        hideSeasonDownloadModal();
+      }
+    } else if (code === 10009) { // Back button
+      hideSeasonDownloadModal();
+    }
+    return;
+  }
+  
+  if (state.view === "landing") {
+    if (code === 37) state.selectedSeries = (state.selectedSeries - 1 + state.seriesList.length) % state.seriesList.length;
+    else if (code === 39) state.selectedSeries = (state.selectedSeries + 1) % state.seriesList.length;
+    else if (code === 13) fetchSeasons();
+    renderLanding();
+  } else if (state.view === "seasons") {
+    if (code === 37 || code === 38) state.selectedSeason = (state.selectedSeason - 1 + state.seasonList.length) % state.seasonList.length;
+    else if (code === 39 || code === 40) state.selectedSeason = (state.selectedSeason + 1) % state.seasonList.length;
+    else if (code === 13) {
+      // This will be handled by keydown event for long press detection
+      // Short press action is handled in keyup event
+      return;
+    }
+    else if (code === 10009){debug("Back " + code); goBack(); return;} 
+    else if (code === 403) { // Red button for download dialog
+      showSeasonDownloadModal();
+      return;
+    }
+    renderSeasons();
+  } else if (state.view === "episodes") {
+    // ...existing episodes code...
+    const listLength = state.episodeList.length;
+
+    if (state.focusMode === "card") {
+      if (code === 38 && state.selectedEpisode > 0) {
+        state.selectedEpisode--;
+      } else if (code === 40 && state.selectedEpisode < listLength - 1) {
+        state.selectedEpisode++;
+      } else if (code === 39) {
+        // Right arrow switches focus to button (only if episode is not downloaded)
+        const ep = state.episodeList[state.selectedEpisode];
+        const isDownloaded = downloadedMsgIds.has(String(ep.msg_id));
+        if (!isDownloaded) {
+          state.focusMode = "button";
+        }
+      } else if (code === 13) {
+        // Enter key on card - download if not downloaded, or play if downloaded
+        debug(`🎬 Enter key pressed: selectedEpisode=${state.selectedEpisode}, episodeList.length=${state.episodeList.length}`);
+        
+        // CRITICAL: Validate episode selection is within bounds
+        if (state.selectedEpisode >= 0 && state.selectedEpisode < state.episodeList.length) {
+          const ep = state.episodeList[state.selectedEpisode];
+          debug(`🎬 Action on episode: ${ep.title} (index ${state.selectedEpisode})`);
+          
+          const isDownloaded = downloadedMsgIds.has(String(ep.msg_id));
+          if (isDownloaded) {
+            playVideo(ep);
+          } else {
+            downloadEpisode(state.selectedEpisode);
+          }
+        } else {
+          debug(`🎬 ERROR: Invalid episode selection! selectedEpisode=${state.selectedEpisode}, episodeList.length=${state.episodeList.length}`);
+        }
+      } else if (code === 10009) {
+        debug("Back " + code);
+        goBack();
+        return;
+      }
+    } else if (state.focusMode === "button") {
+      if (code === 13) {
+        debug(`🎬 Download button Enter pressed: selectedEpisode=${state.selectedEpisode}, episodeList.length=${state.episodeList.length}`);
+        
+        // CRITICAL: Validate episode selection is within bounds
+        if (state.selectedEpisode >= 0 && state.selectedEpisode < state.episodeList.length) {
+          const ep = state.episodeList[state.selectedEpisode];
+          debug(`🎬 Download action on episode: ${ep.title} (index ${state.selectedEpisode})`);
+          downloadEpisode(state.selectedEpisode);
+        } else {
+          debug(`🎬 ERROR: Invalid episode selection for download! selectedEpisode=${state.selectedEpisode}, episodeList.length=${state.episodeList.length}`);
+        }
+      } else if (code === 37) {
+        state.focusMode = "card"; // Left arrow goes back to card
+      } else if(code === 40 && state.selectedEpisode < listLength - 1){
+        state.selectedEpisode++;
+      } else if (code === 38 && state.selectedEpisode > 0){
+        state.selectedEpisode--;
+      } else if( code === 10009) {
+        debug("Back " + code);
+        goBack();
+        return;
+      }
+    }
+
+    updateEpisodeFocus();
+    scrollIntoViewIfNeeded(".episode-grid", state.selectedEpisode);
+  }
+}
+
+function handleKeyDown(code) {
+  // Handle long press detection for Enter key in seasons view
+  if (state.view === "seasons" && code === 13 && !state.enterKeyPressed) {
+    state.enterKeyPressed = true;
+    state.enterKeyTimer = setTimeout(() => {
+      // Long press detected
+      debug("Long press detected - showing download dialog");
+      showSeasonDownloadModal();
+      state.enterKeyPressed = false;
+    }, state.longPressThreshold);
+  }
+}
+
+function handleKeyUp(code) {
+  // Handle short press for Enter key in seasons view
+  if (state.view === "seasons" && code === 13 && state.enterKeyPressed) {
+    if (state.enterKeyTimer) {
+      clearTimeout(state.enterKeyTimer);
+      state.enterKeyTimer = null;
+    }
+    state.enterKeyPressed = false;
+    
+    // Short press - go to episodes
+    state.focusMode = "card";
+    renderEpisodes();
+  }
+}
+
+// Register back key for Smart TV remotes
+document.addEventListener("DOMContentLoaded", () => {
+  if (typeof tizen !== "undefined" && tizen.tvinputdevice) {
+    tizen.tvinputdevice.registerKey("Return");
+    tizen.tvinputdevice.registerKey("MediaPlay");
+    tizen.tvinputdevice.registerKey("MediaPause");
+    tizen.tvinputdevice.registerKey("MediaStop");
+  }
+});
+
+// Key listeners
+window.addEventListener("keydown", e => {
+  handleKeyDown(e.keyCode);
+});
+
+window.addEventListener("keyup", e => {
+  handleKeyUp(e.keyCode);
+  // For non-Enter keys, use the regular handler
+  if (e.keyCode !== 13 || state.view !== "seasons") {
+    handleKey(e.keyCode);
+  }
+});
+
+// Modal button click handlers
+document.addEventListener("DOMContentLoaded", () => {
+  document.getElementById("confirmBtn").addEventListener("click", () => {
+    hideSeasonDownloadModal();
+    downloadWholeSeason();
+  });
+  
+  document.getElementById("cancelBtn").addEventListener("click", () => {
+    hideSeasonDownloadModal();
+  });
+});
+
+function populateAudioTracks() {
+  const audioTrackList = document.getElementById("audioTrackList");
+  audioTrackList.innerHTML = "";
+  
+  if (state.videoPlayer.audioTracks.length === 0) {
+    const noTracks = document.createElement("div");
+    noTracks.className = "audio-track-item";
+    noTracks.textContent = "No audio tracks available";
+    audioTrackList.appendChild(noTracks);
+    return;
+  }
+  
+  state.videoPlayer.audioTracks.forEach((track, index) => {
+    const trackItem = document.createElement("div");
+    trackItem.className = "audio-track-item";
+    if (index === state.videoPlayer.currentAudioTrack) {
+      trackItem.classList.add("active");
+    }
+    
+    const trackName = track.language || track.extra_info || `Track ${index + 1}`;
+    trackItem.textContent = trackName;
+    trackItem.onclick = () => selectAudioTrack(index);
+    
+    audioTrackList.appendChild(trackItem);
+  });
+}
+
+function selectAudioTrack(index) {
+  if (typeof webapis === 'undefined' || !webapis.avplay) return;
+  
+  try {
+    const avplayAudio = webapis.avplay;
+    const track = state.videoPlayer.audioTracks[index];
+    
+    avplayAudio.setSelectTrack('AUDIO', index);
+    state.videoPlayer.currentAudioTrack = index;
+    
+    // Update UI
+    populateAudioTracks();
+    debug(`🎵 Changed to audio track: ${track.language || track.extra_info || `Track ${index + 1}`}`);
+    
+    // Close drawer after selection
+    setTimeout(() => {
+      hideAudioDrawer();
+    }, 500);
+  } catch (error) {
+    debug("❌ Error changing audio track: " + error.message);
+  }
+}
+
+function showAudioDrawer() {
+  document.getElementById("audioDrawer").classList.add("show");
+  state.videoPlayer.audioDrawerVisible = true;
+  state.videoPlayer.selectedAudioTrack = state.videoPlayer.currentAudioTrack;
+  updateAudioTrackSelection();
+}
+
+function hideAudioDrawer() {
+  document.getElementById("audioDrawer").classList.remove("show");
+  state.videoPlayer.audioDrawerVisible = false;
+}
+
+function updateAudioTrackSelection() {
+  const trackItems = document.querySelectorAll(".audio-track-item");
+  trackItems.forEach((item, index) => {
+    if (index === state.videoPlayer.selectedAudioTrack) {
+      item.classList.add("selected");
+    } else {
+      item.classList.remove("selected");
+    }
+  });
+}
+
+function seekFromProgressBar(direction) {
+  const seekAmount = direction > 0 ? 10 : -10; // 10 seconds forward/backward
+  seekVideo(seekAmount);
+}
+
+// Cleanup function to ensure proper video player cleanup
+function cleanup() {
+  if (state.videoPlayer.visible) {
+    stopVideo();
+  }
+}
+
+// Add cleanup when page is unloaded
+window.addEventListener("beforeunload", cleanup);
+window.addEventListener("unload", cleanup);
+
+// Add cleanup on visibility change (when app goes to background)
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && state.videoPlayer.visible) {
+    stopVideo();
+  }
+});
+
+fetchSeries();
+</script>
+</body>
+</html>

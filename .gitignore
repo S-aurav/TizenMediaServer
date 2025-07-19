@@ -1,0 +1,55 @@
+# Environment files
+.env
+.env.local
+.env.production
+
+# Session files
+*.session
+*.session-journal
+
+# Cache and temp files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+cache/
+temp_videos/
+tmp/
+downloads/
+static/
+autoforward_bot.py
+beckup.html
+Bot.py
+catalog.py
+main.py
+progress.html
+seasons.html
+series.py
+stream_server.py
+telethon_cdn_links.py
+series_info.json
+
+# Virtual environment
+myenv/
+venv/
+env/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Video files (too large for git)
+*.mkv
+*.mp4
+*.avi
+*.mov
+
+# Logs
+*.log
