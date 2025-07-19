@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import AuthKeyDuplicatedError, FloodWaitError
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
@@ -21,6 +22,9 @@ load_dotenv()
 API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
+
+# Telegram session configuration
+TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")  # For deployment
 
 # PixelDrain configuration
 PIXELDRAIN_API_KEY = os.getenv("PIXELDRAIN_API_KEY")  # Required for uploads
@@ -66,9 +70,21 @@ download_tasks = {}  # message_id -> asyncio.Task
 async def startup_event():
     global client, cleanup_task
     try:
-        client = TelegramClient('stream_session', API_ID, API_HASH)
-        await client.start(phone=PHONE_NUMBER)
-        print("✅ Telegram client connected")
+        # Use StringSession for deployment, fallback to file session for local development
+        if TELEGRAM_SESSION_STRING:
+            print("🔐 Using StringSession for Telegram authentication...")
+            session = StringSession(TELEGRAM_SESSION_STRING)
+            client = TelegramClient(session, API_ID, API_HASH)
+        else:
+            print("📁 Using file session for Telegram authentication...")
+            client = TelegramClient('stream_session', API_ID, API_HASH)
+        
+        await client.start()
+        print("✅ Telegram client connected successfully")
+        
+        # Verify connection
+        me = await client.get_me()
+        print(f"👤 Logged in as: {me.first_name} ({me.phone})")
         
         # Run initial cleanup of expired files
         print("🧹 Running initial cleanup check...")
@@ -78,12 +94,10 @@ async def startup_event():
         cleanup_task = asyncio.create_task(periodic_cleanup())
         print("⏰ Started periodic cleanup task (runs every 6 hours)")
         
-    except AuthKeyDuplicatedError:
-        os.remove("stream_session.session")
-        client = TelegramClient('stream_session', API_ID, API_HASH)
-        await client.start(phone=PHONE_NUMBER)
     except Exception as e:
-        print(f"Failed to connect Telegram client: {e}")
+        print(f"❌ Failed to connect Telegram client: {e}")
+        print("💡 Make sure TELEGRAM_SESSION_STRING is set in environment variables")
+        # Don't raise exception to allow server to start (for debugging)
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -751,11 +765,15 @@ async def get_direct_stream_url(msg_id: str):
 @app.get("/health")
 async def health_check():
     """Health check endpoint for deployment platforms"""
+    telegram_status = "connected" if client and client.is_connected() else "disconnected"
+    
     return {
         "status": "healthy",
         "service": "Smart TV Streaming Server",
+        "telegram_status": telegram_status,
         "pixeldrain_configured": bool(PIXELDRAIN_API_KEY),
-        "telegram_configured": bool(API_ID and API_HASH and PHONE_NUMBER)
+        "telegram_configured": bool(API_ID and API_HASH),
+        "session_type": "StringSession" if TELEGRAM_SESSION_STRING else "FileSession"
     }
 
 # Add info endpoint

@@ -28,6 +28,7 @@ series.py
 stream_server.py
 telethon_cdn_links.py
 series_info.json
+generate_session.py
 
 # Virtual environment
 myenv/
