@@ -1,0 +1,30 @@
+name: 🛡️ GitHub CRON Backup Keep-Alive
+on:
+  schedule:
+    # Backup schedule - UptimeRobot is primary, this is fallback
+    - cron: '*/10 4-15 * * *'  # Every 10 minutes from 4:30 AM to 3:30 PM UTC (10 AM - 9 PM IST)
+  workflow_dispatch:
+
+jobs:
+  backup-keep-alive:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 🛡️ Backup GitHub CRON Ping
+      run: |
+        echo "🛡️ GitHub CRON Backup Keep-Alive"
+        echo "⏰ Backup trigger: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "🎯 Primary: UptimeRobot (99.9% reliable)"
+        echo "🔄 Backup: GitHub CRON (this workflow)"
+        echo "📈 Dual redundancy for maximum uptime"
+        
+        # Ping the server as backup
+        response=$(curl -s -o /dev/null -w "%{http_code}" "${{ secrets.RENDER_SERVER_URL }}/health" || echo "000")
+        
+        if [ "$response" = "200" ]; then
+          echo "✅ Backup ping successful - Server healthy"
+          echo "::notice::GitHub CRON backup ping succeeded"
+        else
+          echo "⚠️ Backup ping - Server status: $response"
+          echo "::warning::Server may need primary UptimeRobot trigger"
+        fi
