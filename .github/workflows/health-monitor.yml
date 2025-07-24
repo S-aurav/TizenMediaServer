@@ -2,8 +2,8 @@ name: 📊 Server Health Monitor
 
 on:
   schedule:
-    # Run detailed health check every 2 hours during active hours (10 AM - 9 PM)
-    - cron: '0 10,12,14,16,18,20 * * *'  # At 10 AM, 12 PM, 2 PM, 4 PM, 6 PM, 8 PM UTC
+    # Run detailed health check every 2 hours during active hours (10 AM - 9 PM IST = 4:30 AM - 3:30 PM UTC)
+    - cron: '0 4,6,8,10,12,14 * * *'  # At 4 AM, 6 AM, 8 AM, 10 AM, 12 PM, 2 PM UTC (9:30 AM - 7:30 PM IST)
   
   workflow_dispatch:
 
@@ -15,7 +15,7 @@ jobs:
     - name: 🏥 Comprehensive Health Check
       run: |
         echo "🔍 Running comprehensive health check at $(date)"
-        echo "⏰ Active monitoring: 10 AM - 9 PM UTC"
+        echo "⏰ Active monitoring: 10 AM - 9 PM IST (4:30 AM - 3:30 PM UTC)"
         
         SERVER_URL="${{ secrets.RENDER_SERVER_URL || 'https://your-app-name.onrender.com' }}"
         
@@ -61,10 +61,10 @@ jobs:
         
         # Overall health summary
         if [ "$all_healthy" = true ]; then
-          echo "🎉 All systems healthy during active hours!"
+          echo "🎉 All systems healthy during IST active hours!"
           echo "::notice::Server health check passed - All endpoints responding"
         else
-          echo "⚠️ Some issues detected during active hours"
+          echo "⚠️ Some issues detected during IST active hours"
           echo "::warning::Server health check found issues - Check logs"
         fi
 
@@ -73,7 +73,7 @@ jobs:
         echo "📊 GitHub Actions Usage Report"
         echo "=============================="
         echo "🕐 Check time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
-        echo "⏰ User active hours: 10 AM - 9 PM UTC (11 hours daily)"
+        echo "⏰ User active hours: 10 AM - 9 PM IST (4:30 AM - 3:30 PM UTC)"
         echo "🔄 Keep-alive frequency: Every 10 minutes"
         echo "📊 Daily pings: 66"
         echo "📈 Monthly usage: 1,980 minutes (66% of budget)"

@@ -79,10 +79,10 @@ jobs:
           esac
         done
 
-    - name: 🎯 Keep-Alive Simulation (10 AM - 9 PM Pattern)
+    - name: 🎯 Keep-Alive Simulation (10 AM - 9 PM IST Pattern)
       run: |
-        echo "🔄 Simulating keep-alive pings for active hours..."
-        echo "⏰ Pattern: Every 10 minutes during 10 AM - 9 PM"
+        echo "🔄 Simulating keep-alive pings for IST active hours..."
+        echo "⏰ Pattern: Every 10 minutes during 10 AM - 9 PM IST (4:30 AM - 3:30 PM UTC)"
         
         for i in {1..5}; do
           echo "📡 Ping $i/5..."
@@ -110,11 +110,11 @@ jobs:
     - name: 📋 Test Summary
       if: always()
       run: |
-        echo "📊 Test Summary for 10 AM - 9 PM Schedule"
-        echo "========================================"
+        echo "📊 Test Summary for 10 AM - 9 PM IST Schedule"
+        echo "=========================================="
         echo "🕐 Test completed: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
         echo "🎯 Server URL: $SERVER_URL"
-        echo "⏰ Active hours: 10 AM - 9 PM UTC (11 hours daily)"
+        echo "⏰ Active hours: 10 AM - 9 PM IST (4:30 AM - 3:30 PM UTC)"
         echo "🔄 Ping frequency: Every 10 minutes"
         echo "📅 Daily pings: 66"
         echo "📈 Monthly usage: 1,980 minutes"
