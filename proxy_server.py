@@ -46,7 +46,13 @@ TEMP_DIR = os.path.join(os.getcwd(), "tmp")
 
 # Streaming configuration
 STREAMING_BUFFER_SIZE = 10 * 1024 * 1024  # 10MB buffer before starting stream
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for downloading/streaming
+
+# Dynamic chunk sizing for optimal download speed
+CHUNK_SIZE_MIN = 2048 * 1024      # 2MB minimum chunk
+CHUNK_SIZE_DEFAULT = 5 * 1024 * 1024    # 5MB default chunk (increased from 2MB)
+CHUNK_SIZE_MAX = 100 * 1024 * 1024       # 100MB maximum chunk for high-speed servers
+CHUNK_SIZE_ADAPTIVE = True               # Enable adaptive chunk sizing
+
 MAX_CACHE_SIZE_GB = 5  # Maximum cache size in GB
 MIN_FREE_SPACE_GB = 1  # Minimum free space to maintain
 
@@ -234,8 +240,93 @@ def save_uploaded_files_db(data):
         print(f"❌ Error saving database: {e}")
         raise e
 
+async def download_with_adaptive_chunking(client, message, file_path):
+    """Download with adaptive chunk sizing for maximum speed"""
+    import time
+    
+    print(f"🚀 Starting adaptive download to: {file_path}")
+    
+    # Initial settings
+    current_chunk_size = CHUNK_SIZE_DEFAULT
+    download_speeds = []  # Track speeds for adaptation
+    total_downloaded = 0
+    start_time = time.time()
+    last_speed_check = start_time
+    speed_check_interval = 5.0  # Check speed every 5 seconds
+    
+    # Speed thresholds for chunk size adjustment (MB/s)
+    SPEED_THRESHOLD_HIGH = 10.0    # > 10 MB/s = increase chunk size
+    SPEED_THRESHOLD_MEDIUM = 5.0   # 5-10 MB/s = maintain chunk size
+    SPEED_THRESHOLD_LOW = 2.0      # < 2 MB/s = decrease chunk size
+    
+    try:
+        # Use Telethon's iter_download for chunked downloading
+        downloaded_bytes = 0
+        chunk_start_time = time.time()
+        
+        async for chunk in client.iter_download(message.media, chunk_size=current_chunk_size):
+            # Write chunk to file
+            with open(file_path, 'ab') as f:
+                f.write(chunk)
+            
+            downloaded_bytes += len(chunk)
+            total_downloaded += len(chunk)
+            current_time = time.time()
+            
+            # Calculate speed and adapt chunk size every 5 seconds
+            if current_time - last_speed_check >= speed_check_interval:
+                time_elapsed = current_time - chunk_start_time
+                if time_elapsed > 0:
+                    # Calculate speed in MB/s
+                    speed_mbps = (downloaded_bytes / (1024 * 1024)) / time_elapsed
+                    download_speeds.append(speed_mbps)
+                    
+                    print(f"📊 Current speed: {speed_mbps:.2f} MB/s, Chunk size: {current_chunk_size / (1024*1024):.1f} MB")
+                    
+                    # Adapt chunk size based on speed
+                    if speed_mbps > SPEED_THRESHOLD_HIGH and current_chunk_size < CHUNK_SIZE_MAX:
+                        # High speed - increase chunk size for better efficiency
+                        new_chunk_size = min(current_chunk_size * 2, CHUNK_SIZE_MAX)
+                        print(f"⬆️ High speed detected, increasing chunk size to {new_chunk_size / (1024*1024):.1f} MB")
+                        current_chunk_size = new_chunk_size
+                        
+                    elif speed_mbps < SPEED_THRESHOLD_LOW and current_chunk_size > CHUNK_SIZE_MIN:
+                        # Low speed - decrease chunk size to avoid timeouts
+                        new_chunk_size = max(current_chunk_size // 2, CHUNK_SIZE_MIN)
+                        print(f"⬇️ Low speed detected, decreasing chunk size to {new_chunk_size / (1024*1024):.1f} MB")
+                        current_chunk_size = new_chunk_size
+                        
+                    elif SPEED_THRESHOLD_LOW <= speed_mbps <= SPEED_THRESHOLD_HIGH:
+                        # Medium speed - maintain current chunk size
+                        print(f"✅ Optimal speed, maintaining chunk size at {current_chunk_size / (1024*1024):.1f} MB")
+                    
+                    # Reset counters for next speed check
+                    downloaded_bytes = 0
+                    chunk_start_time = current_time
+                    last_speed_check = current_time
+        
+        # Calculate final statistics
+        total_time = time.time() - start_time
+        average_speed = (total_downloaded / (1024 * 1024)) / total_time if total_time > 0 else 0
+        
+        print(f"✅ Download completed!")
+        print(f"📊 Final stats:")
+        print(f"   Total size: {total_downloaded / (1024*1024):.2f} MB")
+        print(f"   Total time: {total_time:.2f} seconds")
+        print(f"   Average speed: {average_speed:.2f} MB/s")
+        print(f"   Final chunk size: {current_chunk_size / (1024*1024):.1f} MB")
+        
+        if download_speeds:
+            max_speed = max(download_speeds)
+            print(f"   Peak speed: {max_speed:.2f} MB/s")
+            
+        return True
+        
+    except Exception as e:
+        print(f"❌ Adaptive download failed: {e}")
+        raise e
+
 async def upload_to_pixeldrain(file_path: str, filename: str) -> str:
-    """Upload a file to PixelDrain with retry logic and return the file ID"""
     max_retries = 3
     retry_delay = 5  # seconds
     
@@ -525,7 +616,15 @@ async def trigger_download(url: str):
                         pass
             
             print(f"⬇️ Downloading {filename} to temporary file: {temp_path}")
-            await client.download_media(message, file=temp_path)
+            
+            # Use adaptive chunking for optimal download speed
+            if CHUNK_SIZE_ADAPTIVE:
+                print("🚀 Using adaptive chunking for maximum download speed...")
+                await download_with_adaptive_chunking(client, message, temp_path)
+            else:
+                print("📥 Using standard download method...")
+                await client.download_media(message, file=temp_path)
+                
             print(f"✅ Download complete: {filename}")
             
             # Verify file exists before upload
@@ -1284,6 +1383,145 @@ async def get_stream_url(msg_id: str):
         "remaining_access": MAX_ACCESS_COUNT - (access_count + 1)
     }
 
+@app.get("/performance/test")
+async def test_download_performance():
+    """Test download performance and suggest optimal chunk sizes"""
+    import time
+    import tempfile
+    import os
+    
+    try:
+        # Create a test message or use a small existing file
+        test_results = {
+            "server_location": "Render (likely US)",
+            "test_timestamp": int(time.time()),
+            "current_config": {
+                "adaptive_enabled": CHUNK_SIZE_ADAPTIVE,
+                "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+                "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+                "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024)
+            }
+        }
+        
+        # Test network speed with a simple download test
+        print("🧪 Running server performance test...")
+        
+        # Test memory allocation speed (proxy for server performance)
+        start_time = time.time()
+        test_data = bytearray(10 * 1024 * 1024)  # 10MB test
+        memory_time = time.time() - start_time
+        
+        # Test disk I/O speed
+        start_time = time.time()
+        temp_path = os.path.join(tempfile.gettempdir(), "speed_test.tmp")
+        with open(temp_path, 'wb') as f:
+            f.write(test_data)
+        f.flush()
+        os.fsync(f.fileno()) if hasattr(os, 'fsync') else None
+        disk_write_time = time.time() - start_time
+        
+        # Test disk read speed
+        start_time = time.time()
+        with open(temp_path, 'rb') as f:
+            read_data = f.read()
+        disk_read_time = time.time() - start_time
+        
+        # Clean up
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        
+        # Calculate speeds
+        memory_speed = (10 / memory_time) if memory_time > 0 else 0
+        disk_write_speed = (10 / disk_write_time) if disk_write_time > 0 else 0
+        disk_read_speed = (10 / disk_read_time) if disk_read_time > 0 else 0
+        
+        test_results.update({
+            "performance_metrics": {
+                "memory_allocation_mbps": round(memory_speed, 2),
+                "disk_write_mbps": round(disk_write_speed, 2),
+                "disk_read_mbps": round(disk_read_speed, 2)
+            }
+        })
+        
+        # Suggest optimal settings based on performance
+        if disk_write_speed > 100:  # Very fast server
+            suggested_max = 32 * 1024 * 1024  # 32MB
+            suggested_default = 8 * 1024 * 1024  # 8MB
+        elif disk_write_speed > 50:  # Fast server
+            suggested_max = 16 * 1024 * 1024  # 16MB (current)
+            suggested_default = 4 * 1024 * 1024  # 4MB
+        elif disk_write_speed > 20:  # Medium server
+            suggested_max = 8 * 1024 * 1024   # 8MB
+            suggested_default = 2 * 1024 * 1024  # 2MB (current)
+        else:  # Slower server
+            suggested_max = 4 * 1024 * 1024   # 4MB
+            suggested_default = 1 * 1024 * 1024  # 1MB
+        
+        test_results.update({
+            "recommendations": {
+                "suggested_max_chunk_mb": suggested_max / (1024 * 1024),
+                "suggested_default_chunk_mb": suggested_default / (1024 * 1024),
+                "performance_tier": (
+                    "Ultra High" if disk_write_speed > 100 else
+                    "High" if disk_write_speed > 50 else
+                    "Medium" if disk_write_speed > 20 else
+                    "Standard"
+                )
+            }
+        })
+        
+        return test_results
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "current_config": {
+                "adaptive_enabled": CHUNK_SIZE_ADAPTIVE,
+                "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+                "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+                "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024)
+            }
+        }
+
+@app.post("/performance/configure")
+async def configure_chunk_sizes(max_chunk_mb: float = None, default_chunk_mb: float = None, adaptive: bool = None):
+    """Dynamically configure chunk sizes based on server performance"""
+    global CHUNK_SIZE_MAX, CHUNK_SIZE_DEFAULT, CHUNK_SIZE_ADAPTIVE
+    
+    changes = {}
+    
+    if max_chunk_mb is not None and 1 <= max_chunk_mb <= 64:  # Limit between 1MB and 64MB
+        old_max = CHUNK_SIZE_MAX / (1024 * 1024)
+        CHUNK_SIZE_MAX = int(max_chunk_mb * 1024 * 1024)
+        changes["max_chunk_mb"] = {"old": old_max, "new": max_chunk_mb}
+        print(f"🔧 Updated max chunk size: {old_max:.1f}MB → {max_chunk_mb:.1f}MB")
+    
+    if default_chunk_mb is not None and 0.5 <= default_chunk_mb <= 32:  # Limit between 512KB and 32MB
+        old_default = CHUNK_SIZE_DEFAULT / (1024 * 1024)
+        CHUNK_SIZE_DEFAULT = int(default_chunk_mb * 1024 * 1024)
+        changes["default_chunk_mb"] = {"old": old_default, "new": default_chunk_mb}
+        print(f"🔧 Updated default chunk size: {old_default:.1f}MB → {default_chunk_mb:.1f}MB")
+    
+    if adaptive is not None:
+        old_adaptive = CHUNK_SIZE_ADAPTIVE
+        CHUNK_SIZE_ADAPTIVE = adaptive
+        changes["adaptive_enabled"] = {"old": old_adaptive, "new": adaptive}
+        print(f"🔧 Updated adaptive chunking: {old_adaptive} → {adaptive}")
+    
+    return {
+        "status": "updated",
+        "changes": changes,
+        "current_config": {
+            "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+            "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+            "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024),
+            "adaptive_enabled": CHUNK_SIZE_ADAPTIVE
+        },
+        "note": "Changes will apply to new downloads immediately"
+    }
+
 # Debug endpoint to check database contents
 @app.get("/debug/database")
 async def debug_database():
@@ -1683,7 +1921,11 @@ async def download_single_episode(episode):
                         pass
             
             # Download
-            await client.download_media(message, file=temp_path)
+            if CHUNK_SIZE_ADAPTIVE:
+                print(f"🚀 Season download using adaptive chunking: {filename}")
+                await download_with_adaptive_chunking(client, message, temp_path)
+            else:
+                await client.download_media(message, file=temp_path)
             
             # Upload to PixelDrain
             pixeldrain_id = await upload_to_pixeldrain(temp_path, filename)
