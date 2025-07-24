@@ -1230,6 +1230,89 @@ async def files_status():
         "provider": "PixelDrain"
     }
 
+# @app.get("/trigger/keep-alive")
+# @app.head("/trigger/keep-alive")
+# async def trigger_keep_alive_external(source: str = "unknown"):
+#     """External trigger endpoint for UptimeRobot (HEAD/GET compatible)"""
+#     import requests
+#     import asyncio
+    
+#     try:
+#         # Get GitHub details from environment
+#         github_token = os.getenv("GITHUB_PAT")
+#         github_repo = os.getenv("GITHUB_REPO")  # format: "username/reponame"
+        
+#         if not github_token or not github_repo:
+#             print("⚠️ External trigger: GitHub PAT or REPO not configured")
+#             return {
+#                 "status": "config_error",
+#                 "message": "GitHub PAT or REPO not configured",
+#                 "source": source,
+#                 "timestamp": int(time.time())
+#             }
+        
+#         # Construct GitHub API URL
+#         github_api_url = f"https://api.github.com/repos/{github_repo}/actions/workflows/external-keep-alive.yml/dispatches"
+        
+#         print(f"🔗 External trigger received from: {source}")
+#         print(f"🚀 Triggering GitHub workflow: {github_api_url}")
+        
+#         # Trigger GitHub workflow asynchronously
+#         def trigger_github_workflow():
+#             try:
+#                 headers = {
+#                     'Accept': 'application/vnd.github+json',
+#                     'Authorization': f'Bearer {github_token}',
+#                     'User-Agent': 'SmartTV-Server-External-Trigger/1.0'
+#                 }
+                
+#                 payload = {
+#                     "ref": "main",
+#                     "inputs": {
+#                         "source": source
+#                     }
+#                 }
+                
+#                 response = requests.post(
+#                     github_api_url,
+#                     headers=headers,
+#                     json=payload,
+#                     timeout=30
+#                 )
+                
+#                 if response.status_code == 204:
+#                     print(f"✅ GitHub workflow triggered successfully from {source}")
+#                     return True
+#                 else:
+#                     print(f"❌ GitHub workflow trigger failed: {response.status_code} - {response.text}")
+#                     return False
+                    
+#             except Exception as e:
+#                 print(f"❌ Error triggering GitHub workflow: {e}")
+#                 return False
+        
+#         # Run GitHub trigger in background (don't make UptimeRobot wait)
+#         asyncio.create_task(asyncio.to_thread(trigger_github_workflow))
+        
+#         # Return immediately to UptimeRobot
+#         return {
+#             "status": "triggered",
+#             "message": "GitHub workflow triggered successfully",
+#             "source": source,
+#             "timestamp": int(time.time()),
+#             "service": "Smart TV Streaming Server",
+#             "external_trigger": True
+#         }
+        
+#     except Exception as e:
+#         print(f"❌ External trigger error: {e}")
+#         return {
+#             "status": "error",
+#             "message": str(e),
+#             "source": source,
+#             "timestamp": int(time.time())
+#         }
+
 # Health check endpoint for deployment
 @app.get("/health")
 async def health_check():
