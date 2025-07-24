@@ -4,6 +4,9 @@ import re
 import asyncio
 import aiohttp
 import tempfile
+import shutil
+import time
+import requests
 from typing import List
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -15,6 +18,7 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 import aiofiles
 from pathlib import Path
+from mega import Mega
 
 
 # Load environment variables
@@ -23,18 +27,31 @@ API_ID = int(os.getenv("API_ID"))
 API_HASH = os.getenv("API_HASH")
 PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 
-# Telegram session configuration
+# Telegram CDN configuration
 TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")  # For deployment
 
-# PixelDrain configuration
-PIXELDRAIN_API_KEY = os.getenv("PIXELDRAIN_API_KEY")  # Required for uploads
-PIXELDRAIN_BASE_URL = "https://pixeldrain.com/api"
+# Database file for tracking downloaded episodes
+DOWNLOADED_FILES_DB = "downloaded_episodes.json"
+UPLOADED_FILES_DB = "uploaded_episodes.json"
 
-# Database file for tracking uploaded files
-UPLOADED_FILES_DB = "uploaded_files.json"
+# Mega.nz configuration
+MEGA_EMAIL = os.getenv("MEGA_EMAIL")
+MEGA_PASSWORD = os.getenv("MEGA_PASSWORD") 
+MEGA_FOLDER_NAME = "SmartTV_Episodes"
 
-# Custom temporary directory (optional) - Railway provides temp space
-CUSTOM_TEMP_DIR = os.getenv("CUSTOM_TEMP_DIR")  # Set in .env if needed
+# Local cache configuration
+CACHE_DIR = os.path.join(os.getcwd(), "cache")
+DOWNLOADS_DIR = os.path.join(os.getcwd(), "downloads")  
+TEMP_DIR = os.path.join(os.getcwd(), "tmp")
+
+# Streaming configuration
+STREAMING_BUFFER_SIZE = 10 * 1024 * 1024  # 10MB buffer before starting stream
+CHUNK_SIZE = 1024 * 1024  # 1MB chunks for downloading/streaming
+MAX_CACHE_SIZE_GB = 5  # Maximum cache size in GB
+MIN_FREE_SPACE_GB = 1  # Minimum free space to maintain
+
+# Custom temporary directory (optional)
+CUSTOM_TEMP_DIR = os.getenv("CUSTOM_TEMP_DIR")
 
 # Get port from environment (Railway sets this automatically)
 PORT = int(os.getenv("PORT", 8000))
@@ -66,6 +83,8 @@ client = None
 progress = {}
 download_tasks = {}  # message_id -> asyncio.Task
 
+mega_client = None
+
 @app.on_event("startup")
 async def startup_event():
     global client, cleanup_task
@@ -85,6 +104,16 @@ async def startup_event():
         # Verify connection
         me = await client.get_me()
         print(f"👤 Logged in as: {me.first_name} ({me.phone})")
+        
+        # Initialize Mega client
+        try:
+            print("🔧 Initializing Mega.nz client...")
+            init_mega_client()
+            account_info = get_mega_account_info()
+            print(f"💾 Mega.nz connected: {account_info['free_gb']:.2f}GB free of {account_info['total_gb']}GB")
+        except Exception as mega_error:
+            print(f"⚠️ Mega.nz initialization failed: {mega_error}")
+            print("💡 Make sure MEGA_EMAIL and MEGA_PASSWORD are set in environment variables")
         
         # Run initial cleanup of expired files
         print("🧹 Running initial cleanup check...")
@@ -142,24 +171,37 @@ async def list_episodes(series_name: str, season_name: str, validate: bool = Fal
         _, msg_id = parse_telegram_url(ep["url"])
         ep["msg_id"] = msg_id
         
-        # Check if file is uploaded to PixelDrain
+        # Check if file is uploaded to Mega.nz or PixelDrain (legacy)
         if str(msg_id) in uploaded_files:
-            pixeldrain_id = uploaded_files[str(msg_id)]["pixeldrain_id"]
+            file_info = uploaded_files[str(msg_id)]
             
-            # Optional real-time validation (slower but accurate)
-            if validate:
-                file_exists = await check_pixeldrain_file_exists(pixeldrain_id)
-                if not file_exists:
-                    # File expired - remove from database
-                    expired_files.append(str(msg_id))
-                    ep["downloaded"] = False
+            if "mega_url" in file_info:
+                # New Mega.nz format
+                mega_url = file_info["mega_url"]
+                
+                # Optional real-time validation (slower but accurate)
+                if validate:
+                    file_exists = await check_mega_file_exists(mega_url)
+                    if not file_exists:
+                        # File expired - remove from database
+                        expired_files.append(str(msg_id))
+                        ep["downloaded"] = False
+                    else:
+                        ep["downloaded"] = True
+                        ep["mega_url"] = mega_url
                 else:
+                    # Fast mode - trust database
                     ep["downloaded"] = True
-                    ep["pixeldrain_id"] = pixeldrain_id
+                    ep["mega_url"] = mega_url
+            elif "pixeldrain_id" in file_info:
+                # Legacy PixelDrain format - mark as not downloaded (need re-upload to Mega)
+                expired_files.append(str(msg_id))
+                ep["downloaded"] = False
+                ep["needs_reupload"] = "pixeldrain_to_mega"
             else:
-                # Fast mode - trust database
-                ep["downloaded"] = True
-                ep["pixeldrain_id"] = pixeldrain_id
+                # Unknown format
+                expired_files.append(str(msg_id))
+                ep["downloaded"] = False
         else:
             ep["downloaded"] = False
     
@@ -183,7 +225,7 @@ def parse_telegram_url(url):
         return int(private_match.group(1)), int(private_match.group(2))
     return None, None
 
-# PixelDrain helper functions
+# Mega.nz helper functions
 def load_uploaded_files_db():
     """Load the database of uploaded files"""
     if os.path.exists(UPLOADED_FILES_DB):
@@ -193,163 +235,100 @@ def load_uploaded_files_db():
 
 def save_uploaded_files_db(data):
     """Save the database of uploaded files"""
-    with open(UPLOADED_FILES_DB, 'w') as f:
-        json.dump(data, f, indent=2)
-
-async def upload_to_pixeldrain(file_path: str, filename: str) -> str:
-    """Upload a file to PixelDrain and return the file ID"""
     try:
-        # PixelDrain requires API key for uploads (even anonymous uploads need a key)
-        if not PIXELDRAIN_API_KEY:
-            raise Exception("PixelDrain API key is required for uploads. Please set PIXELDRAIN_API_KEY in .env file")
-        
-        # Create Basic Auth (username can be empty, password is the API key)
-        import base64
-        credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-        
-        headers = {
-            'Authorization': f'Basic {credentials}'
-        }
-        
-        async with aiohttp.ClientSession() as session:
-            # Read file content
-            async with aiofiles.open(file_path, 'rb') as f:
-                file_content = await f.read()
-                
-                print(f"📤 Uploading {filename} to PixelDrain...")
-                
-                # Use PUT method with file content as body (like curl -T)
-                async with session.put(
-                    f"{PIXELDRAIN_BASE_URL}/file/{filename}",
-                    data=file_content,
-                    headers=headers
-                ) as response:
-                    print(f"🔍 Upload response status: {response.status}")
-                    print(f"🔍 Response headers: {dict(response.headers)}")
-                    
-                    if response.status == 201:
-                        # Handle both JSON and text responses
-                        content_type = response.headers.get('content-type', '')
-                        response_text = await response.text()
-                        
-                        try:
-                            # Try to parse as JSON first
-                            result = json.loads(response_text)
-                            file_id = result.get('id')
-                        except json.JSONDecodeError:
-                            # If not JSON, the response text might be the file ID directly
-                            file_id = response_text.strip()
-                        
-                        print(f"✅ Upload successful! PixelDrain ID: {file_id}")
-                        return file_id
-                    else:
-                        response_text = await response.text()
-                        print(f"❌ Upload failed: {response.status} - {response_text}")
-                        raise Exception(f"PixelDrain upload failed: {response.status} - {response_text}")
-                        
+        print(f"💾 Attempting to save database with {len(data)} entries")
+        with open(UPLOADED_FILES_DB, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"✅ Database saved successfully to {UPLOADED_FILES_DB}")
     except Exception as e:
-        print(f"❌ Error uploading to PixelDrain: {e}")
+        print(f"❌ Error saving database: {e}")
         raise e
 
-async def get_pixeldrain_download_url(file_id: str) -> str:
-    """Get direct download URL from PixelDrain"""
-    return f"{PIXELDRAIN_BASE_URL}/file/{file_id}"
-
-async def check_pixeldrain_file_exists(file_id: str) -> bool:
-    """Check if a file exists on PixelDrain"""
+async def upload_to_mega(file_path: str, filename: str) -> str:
+    """Upload a file to Mega.nz and return the public download URL"""
     try:
-        headers = {}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {credentials}'
+        print(f"🔧 Initializing Mega client for upload...")
+        if not mega_client:
+            print(f"⚠️ Mega client not initialized, initializing now...")
+            folder_id = init_mega_client()
+        else:
+            print(f"✅ Using existing Mega client")
+            # Get folder ID
+            files = mega_client.get_files()
+            folder_id = None
+            for file_id, file_info in files.items():
+                if (file_info.get('a') and 
+                    file_info['a'].get('n') == MEGA_FOLDER_NAME and 
+                    file_info.get('t') == 1):  # t=1 means folder
+                    folder_id = file_id
+                    print(f"📁 Found target folder: {MEGA_FOLDER_NAME} (ID: {file_id})")
+                    break
             
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{PIXELDRAIN_BASE_URL}/file/{file_id}/info",
-                headers=headers
-            ) as response:
-                return response.status == 200
+            if not folder_id:
+                print(f"� Target folder not found, creating: {MEGA_FOLDER_NAME}")
+                folder_result = mega_client.create_folder(MEGA_FOLDER_NAME)
+                # Handle different return formats from mega.py
+                if isinstance(folder_result, dict) and 'f' in folder_result:
+                    folder_id = folder_result['f'][0]['h']
+                else:
+                    folder_id = folder_result
+                print(f"📁 Created folder with ID: {folder_id}")
+        
+        print(f"�📤 Uploading {filename} to Mega.nz folder {MEGA_FOLDER_NAME}...")
+        print(f"📊 File size: {os.path.getsize(file_path) / (1024*1024):.2f} MB")
+        
+        # Check if we need to free up space first
+        file_size_gb = os.path.getsize(file_path) / (1024**3)
+        account_info = get_mega_account_info()
+        print(f"💾 Current space: {account_info['free_gb']:.2f}GB free, need: {file_size_gb:.2f}GB")
+        
+        if account_info['free_gb'] < (MIN_FREE_SPACE_GB + file_size_gb):
+            print(f"⚠️ Low space! Need {file_size_gb:.2f}GB, have {account_info['free_gb']:.2f}GB")
+            await cleanup_old_mega_files(file_size_gb)
+        
+        # Upload file to the episodes folder
+        print(f"🚀 Starting upload to folder ID: {folder_id}")
+        uploaded_file = mega_client.upload(file_path, folder_id)
+        print(f"✅ File uploaded successfully: {uploaded_file}")
+        
+        # Get public download link
+        print(f"🔗 Getting public download link...")
+        download_url = mega_client.get_upload_link(uploaded_file)
+        print(f"🎯 Generated download URL: {download_url}")
+        
+        print(f"✅ Upload successful! Mega URL: {download_url}")
+        return download_url
+        
+    except Exception as e:
+        print(f"❌ Error uploading to Mega: {e}")
+        import traceback
+        print(f"🔍 Full upload error trace: {traceback.format_exc()}")
+        raise e
+
+async def check_mega_file_exists(mega_url: str) -> bool:
+    """Check if a file exists on Mega"""
+    try:
+        # Try to get file info using URL
+        import requests
+        response = requests.head(mega_url, timeout=10)
+        return response.status_code == 200
     except:
         return False
 
-async def stream_from_pixeldrain(file_id: str, start: int = 0, end: int = None):
-    """Stream video file from PixelDrain with range support"""
-    try:
-        headers = {}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {credentials}'
-        
-        # Add range header if specified
-        if start > 0 or end is not None:
-            if end is not None:
-                headers['Range'] = f'bytes={start}-{end}'
-            else:
-                headers['Range'] = f'bytes={start}-'
-        
-        # Use shorter timeout and larger chunks for better TV compatibility
-        timeout = aiohttp.ClientTimeout(total=120, connect=10)  # 2 min total, 10s connect
-        
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get(
-                f"{PIXELDRAIN_BASE_URL}/file/{file_id}",
-                headers=headers
-            ) as response:
-                if response.status in [200, 206]:  # 200 OK or 206 Partial Content
-                    chunk_count = 0
-                    bytes_sent = 0
-                    
-                    try:
-                        # Use larger chunks (4MB) for better streaming performance
-                        async for chunk in response.content.iter_chunked(4 * 1024 * 1024):  # 4MB chunks
-                            if chunk:  # Only yield non-empty chunks
-                                chunk_count += 1
-                                bytes_sent += len(chunk)
-                                
-                                # Log progress every 25 chunks (100MB)
-                                if chunk_count % 25 == 0:
-                                    print(f"📊 Streamed {chunk_count} chunks ({bytes_sent // (1024*1024)} MB)")
-                                
-                                yield chunk
-                            else:
-                                # End of stream
-                                print(f"✅ Stream complete: {chunk_count} chunks, {bytes_sent} bytes")
-                                return
-                                
-                    except asyncio.CancelledError:
-                        print(f"🛑 Stream cancelled by client after {bytes_sent // (1024*1024)} MB")
-                        return
-                    except Exception as stream_error:
-                        print(f"❌ Error during streaming after {bytes_sent // (1024*1024)} MB: {stream_error}")
-                        return
-                        
-                else:
-                    response_text = await response.text()
-                    raise Exception(f"PixelDrain streaming failed: {response.status} - {response_text}")
-                    
-    except asyncio.CancelledError:
-        print("🛑 Stream cancelled")
-        raise
-    except Exception as e:
-        print(f"❌ Error streaming from PixelDrain: {e}")
-        raise
-
-# Download and upload to PixelDrain
+# Download and upload to Mega.nz
 @app.get("/download")
 async def trigger_download(url: str):
     channel, msg_id = parse_telegram_url(url)
     if not channel or not msg_id:
         raise HTTPException(400, "Invalid Telegram URL")
 
-    # Check if already uploaded to PixelDrain
+    # Check if already uploaded to Mega.nz
     uploaded_files = load_uploaded_files_db()
     if str(msg_id) in uploaded_files:
-        pixeldrain_id = uploaded_files[str(msg_id)]["pixeldrain_id"]
-        # Verify file still exists on PixelDrain
-        if await check_pixeldrain_file_exists(pixeldrain_id):
-            return {"status": "already_uploaded", "pixeldrain_id": pixeldrain_id}
+        mega_url = uploaded_files[str(msg_id)]["mega_url"]
+        # Verify file still exists on Mega
+        if await check_mega_file_exists(mega_url):
+            return {"status": "already_uploaded", "mega_url": mega_url}
         else:
             # File expired or deleted, remove from database
             del uploaded_files[str(msg_id)]
@@ -367,8 +346,10 @@ async def trigger_download(url: str):
         return {"status": "uploading"}
 
     async def do_download_and_upload():
-        temp_file = None
+        temp_path = None
         try:
+            print(f"🔄 Starting download and upload for message ID: {msg_id}")
+            
             # Get original file extension from the message
             original_filename = None
             if message.video.attributes:
@@ -383,6 +364,7 @@ async def trigger_download(url: str):
                 file_ext = '.mkv'
             
             filename = f"{msg_id}{file_ext}"
+            print(f"📝 Determined filename: {filename}")
             
             # Create temporary file for download
             if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
@@ -394,34 +376,61 @@ async def trigger_download(url: str):
                 with tempfile.NamedTemporaryFile(suffix=file_ext, delete=False) as temp_file:
                     temp_path = temp_file.name
             
-            print(f"⬇️ Downloading {filename} to temporary file...")
+            print(f"⬇️ Downloading {filename} to temporary file: {temp_path}")
             await client.download_media(message, file=temp_path)
             print(f"✅ Download complete: {filename}")
             
-            # Upload to PixelDrain
-            pixeldrain_id = await upload_to_pixeldrain(temp_path, filename)
+            # Verify file exists before upload
+            if not os.path.exists(temp_path):
+                raise Exception(f"Downloaded file not found: {temp_path}")
+            
+            file_size = os.path.getsize(temp_path)
+            print(f"📊 File size: {file_size / (1024*1024):.2f} MB")
+            
+            # Upload to Mega.nz
+            print(f"🚀 Starting upload to Mega.nz...")
+            mega_url = await upload_to_mega(temp_path, filename)
+            print(f"🎯 Received Mega URL: {mega_url}")
             
             # Save to database
+            print(f"💾 Saving to database...")
             uploaded_files = load_uploaded_files_db()
-            uploaded_files[str(msg_id)] = {
-                "pixeldrain_id": pixeldrain_id,
-                "filename": filename,
-                "uploaded_at": asyncio.get_event_loop().time()
-            }
-            save_uploaded_files_db(uploaded_files)
+            print(f"📋 Current database has {len(uploaded_files)} files")
             
-            print(f"✅ Successfully uploaded {filename} to PixelDrain: {pixeldrain_id}")
+            uploaded_files[str(msg_id)] = {
+                "mega_url": mega_url,
+                "filename": filename,
+                "uploaded_at": int(time.time()),
+                "file_size": message.video.size
+            }
+            
+            print(f"📝 Adding entry for msg_id: {msg_id}")
+            save_uploaded_files_db(uploaded_files)
+            print(f"💾 Database saved successfully")
+            
+            # Verify save worked
+            verification_db = load_uploaded_files_db()
+            if str(msg_id) in verification_db:
+                print(f"✅ Verification: File {msg_id} found in database")
+            else:
+                print(f"⚠️ Warning: File {msg_id} NOT found in database after save")
+            
+            print(f"✅ Successfully uploaded {filename} to Mega.nz: {mega_url}")
             
         except Exception as e:
             print(f"❌ Failed to download/upload {msg_id}: {e}")
+            import traceback
+            print(f"🔍 Full error trace: {traceback.format_exc()}")
         finally:
             # Clean up temporary file
-            if temp_file and os.path.exists(temp_path):
+            if temp_path and os.path.exists(temp_path):
                 try:
                     os.unlink(temp_path)
-                except:
-                    pass
+                    print(f"🧹 Cleaned up temp file: {temp_path}")
+                except Exception as cleanup_error:
+                    print(f"⚠️ Failed to cleanup temp file: {cleanup_error}")
             download_tasks.pop(msg_id, None)
+            print(f"🏁 Download task completed for {msg_id}")
 
     download_tasks[msg_id] = asyncio.create_task(do_download_and_upload())
     return {"status": "uploading"}
@@ -432,151 +441,102 @@ async def list_downloads():
     files = []
     
     for msg_id, file_info in uploaded_files.items():
-        # Verify file still exists on PixelDrain (optional, might be slow)
-        files.append({
-            "msg_id": msg_id,
-            "pixeldrain_id": file_info["pixeldrain_id"],
-            "filename": file_info["filename"]
-        })
+        if "mega_url" in file_info:
+            # New Mega.nz format
+            files.append({
+                "msg_id": msg_id,
+                "mega_url": file_info["mega_url"],
+                "filename": file_info["filename"],
+                "storage": "mega.nz"
+            })
+        elif "pixeldrain_id" in file_info:
+            # Legacy PixelDrain format
+            files.append({
+                "msg_id": msg_id,
+                "pixeldrain_id": file_info["pixeldrain_id"],
+                "filename": file_info["filename"],
+                "storage": "pixeldrain_legacy",
+                "note": "Re-download needed to upload to Mega.nz"
+            })
+        else:
+            # Unknown format
+            files.append({
+                "msg_id": msg_id,
+                "filename": file_info.get("filename", f"{msg_id}.mkv"),
+                "storage": "unknown",
+                "note": "Unknown format, re-download recommended"
+            })
     
     return files
 
 @app.get("/stream_local/{msg_id}")
 async def stream_local(msg_id: str, request: Request):
-    # Get PixelDrain file ID from database
+    # Get file URL from database
     uploaded_files = load_uploaded_files_db()
     
     if str(msg_id) not in uploaded_files:
         raise HTTPException(404, "File not uploaded yet")
     
-    pixeldrain_id = uploaded_files[str(msg_id)]["pixeldrain_id"]
-    filename = uploaded_files[str(msg_id)]["filename"]
+    file_info = uploaded_files[str(msg_id)]
+    filename = file_info.get("filename", f"{msg_id}.mkv")
     
-    # Verify file still exists on PixelDrain
-    if not await check_pixeldrain_file_exists(pixeldrain_id):
-        # File expired or deleted, remove from database
-        del uploaded_files[str(msg_id)]
-        save_uploaded_files_db(uploaded_files)
-        raise HTTPException(404, "File expired or deleted from PixelDrain")
-    
-    print(f"📺 Streaming from PixelDrain: {filename} (ID: {pixeldrain_id})")
-    
-    # Handle range requests for video seeking
-    range_header = request.headers.get('Range')
-    start = 0
-    end = None
-    
-    if range_header:
-        range_match = re.match(r'bytes=(\d+)-(\d*)', range_header)
-        if range_match:
-            start = int(range_match.group(1))
-            if range_match.group(2):
-                end = int(range_match.group(2))
-            print(f"🎯 Range request: {start}-{end if end else 'end'}")
-    
-    try:
-        # Get file info first to determine size for proper headers
-        headers = {}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {credentials}'
-            
-        async with aiohttp.ClientSession() as session:
-            # Get file info
-            async with session.get(
-                f"{PIXELDRAIN_BASE_URL}/file/{pixeldrain_id}/info",
-                headers=headers
-            ) as info_response:
-                if info_response.status == 200:
-                    file_info = await info_response.json()
-                    file_size = file_info.get('size', 0)
-                    print(f"📊 File size: {file_size} bytes")
-                else:
-                    # Fallback - proceed without size info
-                    file_size = None
-                    print("⚠️ Could not get file size, proceeding without size info")
+    if "mega_url" in file_info:
+        # New Mega.nz format
+        mega_url = file_info["mega_url"]
         
-        # Prepare response headers
+        # Verify file still exists on Mega.nz
+        if not await check_mega_file_exists(mega_url):
+            # File expired or deleted, remove from database
+            del uploaded_files[str(msg_id)]
+            save_uploaded_files_db(uploaded_files)
+            raise HTTPException(404, "File expired or deleted from Mega.nz")
+        
+        print(f"📺 Redirecting to Mega.nz direct URL: {filename}")
+        
+        # For Smart TVs, redirect to the direct Mega.nz URL
+        # Mega.nz handles range requests natively
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=mega_url, status_code=302)
+    
+    elif "pixeldrain_id" in file_info:
+        # Legacy PixelDrain format - file needs to be re-uploaded to Mega.nz
+        raise HTTPException(410, "File was stored on PixelDrain. Please re-download to upload to Mega.nz")
+    
+    else:
+        raise HTTPException(404, "File format not supported")
+
+@app.head("/stream_local/{msg_id}")
+async def stream_local_head(msg_id: str):
+    # Get file URL from database
+    uploaded_files = load_uploaded_files_db()
+    
+    if str(msg_id) not in uploaded_files:
+        raise HTTPException(404, "File not uploaded yet")
+    
+    file_info = uploaded_files[str(msg_id)]
+    
+    if "mega_url" in file_info:
+        mega_url = file_info["mega_url"]
+        
+        # Verify file still exists
+        if not await check_mega_file_exists(mega_url):
+            raise HTTPException(404, "File not found on Mega.nz")
+        
+        # Return basic headers for video content
         response_headers = {
             'Accept-Ranges': 'bytes',
             'Content-Type': 'video/mp4',
             'Cache-Control': 'no-cache'
         }
         
-        if range_header and file_size:
-            if end is None:
-                end = file_size - 1
-            end = min(end, file_size - 1)
-            
-            response_headers.update({
-                'Content-Range': f'bytes {start}-{end}/{file_size}',
-                'Content-Length': str(end - start + 1)
-            })
-            
-            print(f"📤 Sending partial content: {start}-{end} ({end - start + 1} bytes)")
-            
-            return StreamingResponse(
-                stream_from_pixeldrain(pixeldrain_id, start, end),
-                status_code=206,
-                headers=response_headers
-            )
-        else:
-            if file_size:
-                response_headers['Content-Length'] = str(file_size)
-            
-            print(f"📤 Sending full content ({file_size} bytes)" if file_size else "📤 Sending full content")
-            
-            return StreamingResponse(
-                stream_from_pixeldrain(pixeldrain_id),
-                status_code=200,
-                headers=response_headers
-            )
-            
-    except Exception as e:
-        print(f"❌ Error setting up PixelDrain stream: {e}")
-        raise HTTPException(500, f"Streaming error: {str(e)}")
-
-@app.head("/stream_local/{msg_id}")
-async def stream_local_head(msg_id: str):
-    # Get PixelDrain file ID from database
-    uploaded_files = load_uploaded_files_db()
+        return JSONResponse(content={}, headers=response_headers)
     
-    if str(msg_id) not in uploaded_files:
-        raise HTTPException(404, "File not uploaded yet")
+    elif "pixeldrain_id" in file_info:
+        # Legacy PixelDrain format
+        raise HTTPException(410, "File was stored on PixelDrain. Please re-download to upload to Mega.nz")
     
-    pixeldrain_id = uploaded_files[str(msg_id)]["pixeldrain_id"]
-    
-    # Verify file still exists and get info
-    try:
-        headers = {}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            credentials = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {credentials}'
-            
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                f"{PIXELDRAIN_BASE_URL}/file/{pixeldrain_id}/info",
-                headers=headers
-            ) as response:
-                if response.status == 200:
-                    file_info = await response.json()
-                    file_size = file_info.get('size', 0)
-                    
-                    response_headers = {
-                        'Accept-Ranges': 'bytes',
-                        'Content-Length': str(file_size),
-                        'Content-Type': 'video/mp4',
-                        'Cache-Control': 'no-cache'
-                    }
-                    
-                    return JSONResponse(content={}, headers=response_headers)
-                else:
-                    raise HTTPException(404, "File not found on PixelDrain")
-    except Exception as e:
-        print(f"❌ Error getting PixelDrain file info: {e}")
-        raise HTTPException(500, f"File info error: {str(e)}")
+    else:
+        raise HTTPException(404, "File format not supported")
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
@@ -600,13 +560,24 @@ async def cleanup_expired_files():
     print("🧹 Starting proactive cleanup of expired files...")
     
     for msg_id, file_info in uploaded_files.items():
-        pixeldrain_id = file_info["pixeldrain_id"]
         filename = file_info.get("filename", f"{msg_id}.mkv")
         
-        # Check if file still exists on PixelDrain
-        if not await check_pixeldrain_file_exists(pixeldrain_id):
+        # Handle both old PixelDrain format and new Mega.nz format
+        if "mega_url" in file_info:
+            # New Mega.nz format
+            mega_url = file_info["mega_url"]
+            # Check if file still exists on Mega.nz
+            if not await check_mega_file_exists(mega_url):
+                expired_files.append(msg_id)
+                print(f"🗑️ Found expired Mega file: {filename} (URL: {mega_url})")
+        elif "pixeldrain_id" in file_info:
+            # Old PixelDrain format - mark for removal since we switched to Mega.nz
             expired_files.append(msg_id)
-            print(f"🗑️ Found expired file: {filename} (ID: {pixeldrain_id})")
+            print(f"🗑️ Found old PixelDrain file (switching to Mega.nz): {filename}")
+        else:
+            # Unknown format - mark for removal
+            expired_files.append(msg_id)
+            print(f"🗑️ Found unknown format file: {filename}")
     
     # Remove expired files from database
     if expired_files:
@@ -620,36 +591,54 @@ async def cleanup_expired_files():
     
     return expired_files
 
-async def validate_all_pixeldrain_files():
+async def validate_all_mega_files():
     """Validate all files in database and return status"""
     uploaded_files = load_uploaded_files_db()
     validation_results = {
         "total_files": len(uploaded_files),
         "valid_files": 0,
         "expired_files": 0,
+        "pixeldrain_files": 0,
         "expired_list": []
     }
     
     for msg_id, file_info in uploaded_files.items():
-        pixeldrain_id = file_info["pixeldrain_id"]
         filename = file_info.get("filename", f"{msg_id}.mkv")
         
-        if await check_pixeldrain_file_exists(pixeldrain_id):
-            validation_results["valid_files"] += 1
+        if "mega_url" in file_info:
+            # New Mega.nz format
+            mega_url = file_info["mega_url"]
+            if await check_mega_file_exists(mega_url):
+                validation_results["valid_files"] += 1
+            else:
+                validation_results["expired_files"] += 1
+                validation_results["expired_list"].append({
+                    "msg_id": msg_id,
+                    "filename": filename,
+                    "mega_url": mega_url,
+                    "status": "expired"
+                })
+        elif "pixeldrain_id" in file_info:
+            # Old PixelDrain format
+            validation_results["pixeldrain_files"] += 1
+            validation_results["expired_list"].append({
+                "msg_id": msg_id,
+                "filename": filename,
+                "pixeldrain_id": file_info["pixeldrain_id"],
+                "status": "old_format_pixeldrain"
+            })
         else:
+            # Unknown format
             validation_results["expired_files"] += 1
             validation_results["expired_list"].append({
                 "msg_id": msg_id,
                 "filename": filename,
-                "pixeldrain_id": pixeldrain_id
+                "status": "unknown_format"
             })
     
     return validation_results
 
 # Background task for periodic cleanup
-import asyncio
-from contextlib import asynccontextmanager
-
 cleanup_task = None
 
 async def periodic_cleanup():
@@ -679,7 +668,7 @@ async def manual_cleanup():
 async def validate_files():
     """Validate all uploaded files and return status"""
     try:
-        results = await validate_all_pixeldrain_files()
+        results = await validate_all_mega_files()
         return results
     except Exception as e:
         raise HTTPException(500, f"Validation failed: {str(e)}")
@@ -720,7 +709,7 @@ async def get_temp_info():
                 "free_percentage": round((free / total) * 100, 1)
             },
             "current_downloads": len(download_tasks),
-            "note": "Temporary files are deleted after upload to PixelDrain"
+            "note": "Temporary files are deleted after upload to Mega.nz"
         }
     except Exception as e:
         return {
@@ -732,34 +721,42 @@ async def get_temp_info():
 # Add direct streaming URL endpoint
 @app.get("/stream_direct/{msg_id}")
 async def get_direct_stream_url(msg_id: str):
-    """Get direct PixelDrain streaming URL instead of proxying through our server"""
-    # Get PixelDrain file ID from database
+    """Get direct Mega.nz streaming URL instead of proxying through our server"""
+    # Get file URL from database
     uploaded_files = load_uploaded_files_db()
     
     if str(msg_id) not in uploaded_files:
         raise HTTPException(404, "File not uploaded yet")
     
-    pixeldrain_id = uploaded_files[str(msg_id)]["pixeldrain_id"]
-    filename = uploaded_files[str(msg_id)]["filename"]
+    file_info = uploaded_files[str(msg_id)]
+    filename = file_info.get("filename", f"{msg_id}.mkv")
     
-    # Verify file still exists on PixelDrain
-    if not await check_pixeldrain_file_exists(pixeldrain_id):
-        # File expired or deleted, remove from database
-        del uploaded_files[str(msg_id)]
-        save_uploaded_files_db(uploaded_files)
-        raise HTTPException(404, "File expired or deleted from PixelDrain")
+    if "mega_url" in file_info:
+        # New Mega.nz format
+        mega_url = file_info["mega_url"]
+        
+        # Verify file still exists on Mega.nz
+        if not await check_mega_file_exists(mega_url):
+            # File expired or deleted, remove from database
+            del uploaded_files[str(msg_id)]
+            save_uploaded_files_db(uploaded_files)
+            raise HTTPException(404, "File expired or deleted from Mega.nz")
+        
+        # Return direct Mega.nz streaming URL
+        print(f"🔗 Providing direct Mega.nz URL for {filename}: {mega_url}")
+        
+        return {
+            "direct_url": mega_url,
+            "filename": filename,
+            "note": "Use this URL directly in your video player for better streaming performance"
+        }
     
-    # Return direct PixelDrain streaming URL
-    direct_url = f"{PIXELDRAIN_BASE_URL}/file/{pixeldrain_id}"
+    elif "pixeldrain_id" in file_info:
+        # Legacy PixelDrain format
+        raise HTTPException(410, "File was stored on PixelDrain. Please re-download to upload to Mega.nz")
     
-    print(f"🔗 Providing direct PixelDrain URL for {filename}: {direct_url}")
-    
-    return {
-        "direct_url": direct_url,
-        "pixeldrain_id": pixeldrain_id,
-        "filename": filename,
-        "note": "Use this URL directly in your video player for better streaming performance"
-    }
+    else:
+        raise HTTPException(404, "File format not supported")
 
 # Add health check endpoint for deployment
 @app.get("/health")
@@ -767,11 +764,17 @@ async def health_check():
     """Health check endpoint for deployment platforms"""
     telegram_status = "connected" if client and client.is_connected() else "disconnected"
     
+    try:
+        mega_status = "connected" if mega_client else "not initialized"
+    except:
+        mega_status = "error"
+    
     return {
         "status": "healthy",
         "service": "Smart TV Streaming Server",
         "telegram_status": telegram_status,
-        "pixeldrain_configured": bool(PIXELDRAIN_API_KEY),
+        "mega_configured": bool(MEGA_EMAIL and MEGA_PASSWORD),
+        "mega_status": mega_status,
         "telegram_configured": bool(API_ID and API_HASH),
         "session_type": "StringSession" if TELEGRAM_SESSION_STRING else "FileSession"
     }
@@ -788,9 +791,336 @@ async def root():
             "download": "/download?url=TELEGRAM_URL",
             "stream_direct": "/stream_direct/{msg_id}",
             "stream_local": "/stream_local/{msg_id}",
+            "hls": "/hls/{msg_id}/playlist.m3u8",
             "health": "/health"
         }
     }
+
+# HLS Streaming Implementation for AVPlay compatibility
+@app.get("/hls/{msg_id}/playlist.m3u8")
+async def hls_playlist(msg_id: str):
+    """Generate HLS playlist for progressive downloading episodes"""
+    # Get file info from database
+    uploaded_files = load_uploaded_files_db()
+    
+    if str(msg_id) not in uploaded_files:
+        raise HTTPException(404, "File not uploaded yet")
+    
+    file_info = uploaded_files[str(msg_id)]
+    filename = file_info.get("filename", f"{msg_id}.mkv")
+    
+    if "mega_url" not in file_info:
+        raise HTTPException(404, "File not available for HLS streaming")
+    
+    mega_url = file_info["mega_url"]
+    
+    # Verify file still exists on Mega.nz
+    if not await check_mega_file_exists(mega_url):
+        # File expired or deleted, remove from database
+        del uploaded_files[str(msg_id)]
+        save_uploaded_files_db(uploaded_files)
+        raise HTTPException(404, "File expired or deleted from Mega.nz")
+    
+    print(f"🎬 Generating HLS playlist for {filename}")
+    
+    # For now, create a simple single-segment HLS playlist that points to the Mega.nz URL
+    # This allows AVPlay to treat it as an HLS stream while still using the direct URL
+    playlist_content = f"""#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:3600
+#EXT-X-MEDIA-SEQUENCE:0
+#EXT-X-PLAYLIST-TYPE:VOD
+#EXTINF:3600.0,
+{mega_url}
+#EXT-X-ENDLIST
+"""
+    
+    # Return as HLS playlist with proper content type
+    from fastapi.responses import Response
+    return Response(
+        content=playlist_content,
+        media_type="application/vnd.apple.mpegurl",
+        headers={
+            "Cache-Control": "no-cache",
+            "Access-Control-Allow-Origin": "*"
+        }
+    )
+
+@app.get("/hls/{msg_id}/segment_{segment_id}.ts")
+async def hls_segment(msg_id: str, segment_id: str, request: Request):
+    """Handle HLS segment requests (for future advanced implementation)"""
+    # For now, redirect all segment requests to the main Mega.nz URL
+    # This is a simplified approach - in the future we could implement true segmentation
+    uploaded_files = load_uploaded_files_db()
+    
+    if str(msg_id) not in uploaded_files:
+        raise HTTPException(404, "File not uploaded yet")
+    
+    file_info = uploaded_files[str(msg_id)]
+    
+    if "mega_url" not in file_info:
+        raise HTTPException(404, "File not available for HLS streaming")
+    
+    mega_url = file_info["mega_url"]
+    
+    print(f"🧩 HLS segment {segment_id} requested for {msg_id}, redirecting to Mega.nz")
+    
+    # Redirect to the main Mega.nz URL with range headers if provided
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=mega_url, status_code=302)
+
+async def cleanup_old_mega_files(required_space_gb: float = 0):
+    """Delete old files from Mega to free up space"""
+    try:
+        if not mega_client:
+            init_mega_client()
+        
+        # Get current uploaded files from database
+        uploaded_files = load_uploaded_files_db()
+        
+        if not uploaded_files:
+            return 0
+        
+        # Sort files by upload time (oldest first)
+        sorted_files = sorted(
+            uploaded_files.items(),
+            key=lambda x: x[1].get('uploaded_at', 0)
+        )
+        
+        deleted_count = 0
+        freed_space_gb = 0
+        
+        account_info = get_mega_account_info()
+        current_free_gb = account_info['free_gb']
+        
+        print(f"🧹 Current free space: {current_free_gb:.2f}GB")
+        print(f"🎯 Target free space: {MIN_FREE_SPACE_GB + required_space_gb:.2f}GB")
+        
+        for msg_id, file_info in sorted_files:
+            # Check if we have enough free space
+            if current_free_gb >= (MIN_FREE_SPACE_GB + required_space_gb):
+                break
+            
+            try:
+                # Delete from Mega
+                mega_url = file_info.get('mega_url', '')
+                if mega_url:
+                    # Extract file ID from Mega URL
+                    file_id = extract_mega_file_id(mega_url)
+                    if file_id:
+                        mega_client.delete(file_id)
+                        
+                        file_size_gb = file_info.get('file_size', 0) / (1024**3)
+                        current_free_gb += file_size_gb
+                        freed_space_gb += file_size_gb
+                        deleted_count += 1
+                        
+                        print(f"🗑️ Deleted old file: {file_info.get('filename', msg_id)} ({file_size_gb:.2f}GB)")
+                
+                # Remove from database
+                del uploaded_files[msg_id]
+                
+            except Exception as e:
+                print(f"⚠️ Error deleting file {msg_id}: {e}")
+                # Remove from database anyway to keep it clean
+                del uploaded_files[msg_id]
+        
+        # Save updated database
+        save_uploaded_files_db(uploaded_files)
+        
+        print(f"✅ Cleanup complete: Deleted {deleted_count} files, freed {freed_space_gb:.2f}GB")
+        return deleted_count
+        
+    except Exception as e:
+        print(f"❌ Error during Mega cleanup: {e}")
+        return 0
+
+def extract_mega_file_id(mega_url: str) -> str:
+    """Extract file ID from Mega URL"""
+    try:
+        # Mega URLs format: https://mega.nz/file/FILE_ID#KEY
+        if '/file/' in mega_url:
+            file_part = mega_url.split('/file/')[1]
+            return file_part.split('#')[0]
+        return None
+    except:
+        return None
+
+async def delete_from_mega(mega_url: str):
+    """Delete a file from Mega"""
+    try:
+        if not mega_client:
+            init_mega_client()
+        
+        file_id = extract_mega_file_id(mega_url)
+        if file_id:
+            mega_client.delete(file_id)
+            print(f"🗑️ Deleted from Mega: {file_id}")
+            
+    except Exception as e:
+        print(f"❌ Error deleting from Mega: {e}")
+
+# Add endpoint for storage management
+@app.get("/storage/info")
+async def get_storage_info():
+    """Get Mega storage information"""
+    try:
+        account_info = get_mega_account_info()
+        uploaded_files = load_uploaded_files_db()
+        
+        return {
+            "provider": "mega.nz",
+            "storage": account_info,
+            "files_count": len(uploaded_files),
+            "min_free_space_gb": MIN_FREE_SPACE_GB
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/storage/cleanup")
+async def manual_storage_cleanup():
+    """Manually trigger storage cleanup"""
+    try:
+        deleted_count = await cleanup_old_mega_files()
+        account_info = get_mega_account_info()
+        
+        return {
+            "deleted_files": deleted_count,
+            "storage_after_cleanup": account_info
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+def init_mega_client():
+    """Initialize Mega client and return folder info"""
+    global mega_client
+    try:
+        print(f"🔧 Initializing Mega client...")
+        if not MEGA_EMAIL or not MEGA_PASSWORD:
+            raise Exception("Mega credentials not found. Set MEGA_EMAIL and MEGA_PASSWORD in .env")
+        
+        print(f"🔐 Logging in to Mega with email: {MEGA_EMAIL}")
+        mega = Mega()
+        mega_client = mega.login(MEGA_EMAIL, MEGA_PASSWORD)
+        print(f"✅ Successfully logged into Mega.nz")
+        
+        # Get or create the episodes folder
+        print(f"📁 Getting file list from Mega...")
+        files = mega_client.get_files()
+        print(f"📊 Found {len(files)} items in Mega account")
+        
+        folder_id = None
+        
+        # Look for existing folder
+        print(f"🔍 Searching for folder: {MEGA_FOLDER_NAME}")
+        for file_id, file_info in files.items():
+            if (file_info.get('a') and 
+                file_info['a'].get('n') == MEGA_FOLDER_NAME and 
+                file_info.get('t') == 1):  # t=1 means folder
+                folder_id = file_id
+                print(f"📁 Found existing folder: {MEGA_FOLDER_NAME} (ID: {file_id})")
+                break
+        
+        # Create folder if it doesn't exist
+        if not folder_id:
+            print(f"📁 Creating new folder: {MEGA_FOLDER_NAME}")
+            folder_result = mega_client.create_folder(MEGA_FOLDER_NAME)
+            print(f"📁 Folder creation result: {folder_result}")
+            
+            # Handle different return formats from mega.py
+            if isinstance(folder_result, dict) and 'f' in folder_result:
+                folder_id = folder_result['f'][0]['h']
+            else:
+                folder_id = folder_result
+            print(f"📁 Created Mega folder: {MEGA_FOLDER_NAME} (ID: {folder_id})")
+        else:
+            print(f"📁 Using existing Mega folder: {MEGA_FOLDER_NAME} (ID: {folder_id})")
+        
+        return folder_id
+        
+    except Exception as e:
+        print(f"❌ Failed to initialize Mega client: {e}")
+        import traceback
+        print(f"🔍 Full init error trace: {traceback.format_exc()}")
+        raise e
+
+def get_mega_account_info():
+    """Get Mega account storage information"""
+    try:
+        if not mega_client:
+            init_mega_client()
+        
+        quota = mega_client.get_quota()
+        used_gb = quota / (1024**3)  # Convert to GB
+        total_gb = 20  # Free account limit
+        free_gb = total_gb - used_gb
+        
+        return {
+            "total_gb": total_gb,
+            "used_gb": round(used_gb, 2),
+            "free_gb": round(free_gb, 2)
+        }
+        
+    except Exception as e:
+        print(f"❌ Error getting Mega account info: {e}")
+        return {"total_gb": 20, "used_gb": 0, "free_gb": 20}
+
+# Debug endpoints for testing
+@app.get("/debug/database")
+async def debug_database():
+    """Debug endpoint to check database status"""
+    try:
+        uploaded_files = load_uploaded_files_db()
+        return {
+            "database_file": UPLOADED_FILES_DB,
+            "database_exists": os.path.exists(UPLOADED_FILES_DB),
+            "file_count": len(uploaded_files),
+            "files": uploaded_files,
+            "file_size_bytes": os.path.getsize(UPLOADED_FILES_DB) if os.path.exists(UPLOADED_FILES_DB) else 0
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "database_file": UPLOADED_FILES_DB,
+            "database_exists": os.path.exists(UPLOADED_FILES_DB)
+        }
+
+@app.get("/debug/mega")
+async def debug_mega():
+    """Debug endpoint to check Mega connection"""
+    try:
+        if not mega_client:
+            init_mega_client()
+        
+        account_info = get_mega_account_info()
+        files = mega_client.get_files()
+        
+        # Find the episodes folder
+        episodes_folder = None
+        for file_id, file_info in files.items():
+            if (file_info.get('a') and 
+                file_info['a'].get('n') == MEGA_FOLDER_NAME and 
+                file_info.get('t') == 1):
+                episodes_folder = {
+                    "id": file_id,
+                    "name": file_info['a']['n']
+                }
+                break
+        
+        return {
+            "mega_connected": bool(mega_client),
+            "account_info": account_info,
+            "total_files": len(files),
+            "episodes_folder": episodes_folder,
+            "folder_name": MEGA_FOLDER_NAME
+        }
+    except Exception as e:
+        return {
+            "error": str(e),
+            "mega_connected": bool(mega_client)
+        }
+
+
 
 if __name__ == "__main__":
     import uvicorn

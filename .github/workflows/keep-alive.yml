@@ -1,0 +1,70 @@
+name: 🔄 Keep Render Server Awake
+
+on:
+  schedule:
+    # Ping every 10 minutes during user active hours (10 AM - 9 PM UTC)
+    # This runs 66 times per day = 1,980 minutes per month (66% of 3,000 budget)
+    - cron: '*/10 10-20 * * *'  # Every 10 minutes from 10 AM to 9 PM UTC
+  
+  # Allow manual triggering for testing
+  workflow_dispatch:
+
+jobs:
+  keep-alive:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 🏥 Ping Health Endpoint
+      run: |
+        echo "🚀 Pinging server at $(date)"
+        echo "⏰ Active hours: 10 AM - 9 PM UTC (11 hours daily)"
+        
+        # Your Render app URL - replace with your actual URL
+        SERVER_URL="${{ secrets.RENDER_SERVER_URL || 'https://your-app-name.onrender.com' }}"
+        
+        # Ping the health endpoint with timeout and retries
+        for i in {1..3}; do
+          echo "📡 Attempt $i/3..."
+          
+          # Make the request and capture response
+          response=$(curl -s -w "\nHTTP_STATUS:%{http_code}\nTIME_TOTAL:%{time_total}" \
+            --max-time 30 \
+            --retry 2 \
+            --retry-delay 5 \
+            "$SERVER_URL/health" || echo "CURL_FAILED")
+          
+          # Extract HTTP status and response time
+          http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d: -f2)
+          time_total=$(echo "$response" | grep "TIME_TOTAL:" | cut -d: -f2)
+          
+          if [ "$http_status" = "200" ]; then
+            echo "✅ Server is healthy!"
+            echo "⏱️ Response time: ${time_total}s"
+            echo "📊 Status: $http_status"
+            
+            # Log successful ping
+            echo "::notice::Server ping successful - Response time: ${time_total}s"
+            break
+          else
+            echo "⚠️ Attempt $i failed with status: $http_status"
+            if [ $i -eq 3 ]; then
+              echo "❌ All ping attempts failed!"
+              echo "::error::Server ping failed after 3 attempts - Status: $http_status"
+              exit 1
+            fi
+            sleep 10
+          fi
+        done
+
+    - name: 📊 Log Usage Stats
+      if: always()
+      run: |
+        echo "📈 Keep-Alive Stats:"
+        echo "🕐 Ping time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "⏰ Active hours: 10 AM - 9 PM UTC (11 hours daily)"
+        echo "🎯 Strategy: Custom User Hours (10 AM - 9 PM)"
+        echo "🔄 Ping frequency: Every 10 minutes"
+        echo "📅 Daily pings: 66"
+        echo "📅 Expected monthly usage: 1,980 minutes"
+        echo "💰 Budget utilization: 66% of 3,000 minutes"
+        echo "🎉 Remaining budget: 1,020 minutes for other workflows"

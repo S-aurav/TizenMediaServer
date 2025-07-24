@@ -1,0 +1,123 @@
+name: 🧪 Test Server Connection
+
+on:
+  workflow_dispatch:
+    inputs:
+      server_url:
+        description: 'Server URL to test (optional - uses secret if not provided)'
+        required: false
+        type: string
+
+jobs:
+  test-connection:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: 🔧 Setup Test Parameters
+      run: |
+        if [ -n "${{ github.event.inputs.server_url }}" ]; then
+          echo "SERVER_URL=${{ github.event.inputs.server_url }}" >> $GITHUB_ENV
+        else
+          echo "SERVER_URL=${{ secrets.RENDER_SERVER_URL || 'https://your-app-name.onrender.com' }}" >> $GITHUB_ENV
+        fi
+        echo "🎯 Testing server: $SERVER_URL"
+
+    - name: 🏓 Basic Ping Test
+      run: |
+        echo "🚀 Starting basic connectivity test..."
+        
+        response=$(curl -s -w "\nHTTP_STATUS:%{http_code}\nTIME_TOTAL:%{time_total}\nTIME_CONNECT:%{time_connect}" \
+          --max-time 30 \
+          "$SERVER_URL/health")
+        
+        echo "📄 Response body:"
+        echo "$response" | head -n -3
+        echo ""
+        
+        http_status=$(echo "$response" | grep "HTTP_STATUS:" | cut -d: -f2)
+        time_total=$(echo "$response" | grep "TIME_TOTAL:" | cut -d: -f2)
+        time_connect=$(echo "$response" | grep "TIME_CONNECT:" | cut -d: -f2)
+        
+        echo "📊 Connection Stats:"
+        echo "   Status: $http_status"
+        echo "   Connect time: ${time_connect}s"
+        echo "   Total time: ${time_total}s"
+        
+        if [ "$http_status" = "200" ]; then
+          echo "✅ Basic ping test PASSED"
+        else
+          echo "❌ Basic ping test FAILED"
+          exit 1
+        fi
+
+    - name: 🌐 Endpoint Discovery
+      run: |
+        echo "🔍 Testing available endpoints..."
+        
+        endpoints=(
+          "/"
+          "/health"
+          "/catalog/series"
+          "/files/status" 
+          "/downloads"
+          "/storage/info"
+        )
+        
+        for endpoint in "${endpoints[@]}"; do
+          echo "🌍 Testing: $endpoint"
+          
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 10 \
+            "$SERVER_URL$endpoint" || echo "TIMEOUT")
+          
+          case $status in
+            200) echo "   ✅ $endpoint: OK" ;;
+            404) echo "   ⚠️ $endpoint: Not Found" ;;
+            500) echo "   ❌ $endpoint: Server Error" ;;
+            TIMEOUT) echo "   ⏰ $endpoint: Timeout" ;;
+            *) echo "   ❓ $endpoint: Status $status" ;;
+          esac
+        done
+
+    - name: 🎯 Keep-Alive Simulation (10 AM - 9 PM Pattern)
+      run: |
+        echo "🔄 Simulating keep-alive pings for active hours..."
+        echo "⏰ Pattern: Every 10 minutes during 10 AM - 9 PM"
+        
+        for i in {1..5}; do
+          echo "📡 Ping $i/5..."
+          
+          start_time=$(date +%s.%N)
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            --max-time 15 \
+            "$SERVER_URL/health")
+          end_time=$(date +%s.%N)
+          
+          duration=$(echo "$end_time - $start_time" | bc)
+          
+          if [ "$status" = "200" ]; then
+            echo "   ✅ Ping $i: OK (${duration}s)"
+          else
+            echo "   ❌ Ping $i: FAILED (Status: $status)"
+          fi
+          
+          # Wait 2 seconds between pings
+          sleep 2
+        done
+        
+        echo "🎉 Keep-alive simulation complete!"
+
+    - name: 📋 Test Summary
+      if: always()
+      run: |
+        echo "📊 Test Summary for 10 AM - 9 PM Schedule"
+        echo "========================================"
+        echo "🕐 Test completed: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+        echo "🎯 Server URL: $SERVER_URL"
+        echo "⏰ Active hours: 10 AM - 9 PM UTC (11 hours daily)"
+        echo "🔄 Ping frequency: Every 10 minutes"
+        echo "📅 Daily pings: 66"
+        echo "📈 Monthly usage: 1,980 minutes"
+        echo "💰 Budget efficiency: 66% of 3,000 minutes"
+        echo "🔧 GitHub Actions environment: ubuntu-latest"
+        echo "📈 Ready for optimized keep-alive deployment!"
