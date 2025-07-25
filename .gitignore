@@ -24,6 +24,8 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+backupFiles/
+myenv/
 
 # PyInstaller
 *.manifest
@@ -122,7 +124,6 @@ temp/
 *.mp4
 *.avi
 *.mov
-uploaded_episodes.json
 downloaded_episodes.json
 
 # IDE
@@ -137,3 +138,32 @@ Thumbs.db
 
 
 Bot.py
+avplay_buffering_test.html
+avplay_streaming_player.html
+CHUNKED_IMPLEMENTATION.md
+custom_smart_tv_player.html
+custom_video_player.html
+diagnose_file.py
+EXTERNAL_CRON_SETUP.md
+hls_test.html
+hls_tizen_test.html
+install_ffmpeg.py
+memory_safe_verification.py
+proxy_interface.html
+README_Modular.md
+README_PROXY.md
+setup_external_cron.py
+simple_upload_test.py
+start_proxy.bat
+start_server.bat
+test_chunks.py
+test_headers.py
+test_hls.py
+test_memory_safe_upload.py
+test_pixeldrain.py
+test_streaming.py
+THRESHOLD_UPDATE.md
+tizen4_compatible_player.html
+memory_safe_verification_report.md
+backup-keep-alive.yml
+verify_memory_safe.py
