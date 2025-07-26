@@ -11,11 +11,15 @@ class DownloadScheduler:
     def __init__(self):
         self.scheduler_running = False
         self.scheduler_task = None
+        self.client = None  # Store client reference
         
-    async def start_scheduler(self):
+    async def start_scheduler(self, client=None):
         """Start the download scheduler"""
         if self.scheduler_running:
             return
+        
+        if client:
+            self.client = client
         
         self.scheduler_running = True
         self.scheduler_task = asyncio.create_task(self._scheduler_loop())
@@ -69,7 +73,7 @@ class DownloadScheduler:
                 await asyncio.sleep(5)
     
     async def _execute_download(self, slot_id: int, task: DownloadTask):
-        """Execute a download task in a specific slot"""
+        """Execute a download task in a specific slot using just-in-time message fetching"""
         success = False
         
         try:
@@ -83,19 +87,21 @@ class DownloadScheduler:
                     success = True
                     return
             
-            # Start actual download and upload
-            # Use chunked download/upload from download_manager
-            from telethon import TelegramClient
-            pixeldrain_id = await chunked_download_upload(
-                task.message._client,  # Get client from message
-                task.message,
+            # Use just-in-time message fetching to avoid file reference expiration
+            from download_manager import get_fresh_message_and_download
+            from upload_manager import upload_to_pixeldrain
+            
+            pixeldrain_id = await get_fresh_message_and_download(
+                self.client,  # Use scheduler's client reference
+                task.channel,
+                task.msg_id,
                 task.filename,
                 upload_to_pixeldrain
             )
             
             # Save to database
             uploaded_files = load_uploaded_files_db()
-            file_size = get_file_size_from_message(task.message)
+            file_size = 0  # We'll get this from the fresh message
             
             uploaded_files[str(task.msg_id)] = {
                 "pixeldrain_id": pixeldrain_id,
@@ -137,7 +143,7 @@ class DownloadScheduler:
                     "msg_id": msg_id
                 }
         
-        # Get message from Telegram
+        # Get message info for filename (but don't store the message object)
         if not client.is_connected():
             await client.connect()
         
@@ -145,14 +151,13 @@ class DownloadScheduler:
         if not message or (not message.video and not message.document):
             raise ValueError("No video or document found")
         
-        # Create download task
+        # Create download task (WITHOUT storing message object)
         file_ext = get_file_extension_from_message(message)
         filename = f"{msg_id}{file_ext}"
         
         task = DownloadTask(
             msg_id=msg_id,
-            channel=channel,
-            message=message,
+            channel=channel,  # Store channel, not message
             filename=filename,
             priority=DownloadPriority.HIGH,  # Single episodes are HIGH priority
             created_at=time.time()
@@ -162,7 +167,7 @@ class DownloadScheduler:
         if queue_manager.add_download_task(task):
             # Start scheduler if not running
             if not self.scheduler_running:
-                await self.start_scheduler()
+                await self.start_scheduler(client)
             
             return {
                 "status": "queued",
@@ -191,7 +196,7 @@ class DownloadScheduler:
             if await check_pixeldrain_file_exists(file_info["pixeldrain_id"]):
                 return True  # Already exists
         
-        # Get message from Telegram
+        # Get message info for filename (but don't store the message object)
         if not client.is_connected():
             await client.connect()
         
@@ -199,14 +204,13 @@ class DownloadScheduler:
         if not message or (not message.video and not message.document):
             return False
         
-        # Create download task
+        # Create download task (WITHOUT storing message object)
         file_ext = get_file_extension_from_message(message)
         filename = f"{msg_id}{file_ext}"
         
         task = DownloadTask(
             msg_id=msg_id,
-            channel=channel,
-            message=message,
+            channel=channel,  # Store channel, not message
             filename=filename,
             priority=DownloadPriority.LOW,  # Season episodes are LOW priority
             created_at=time.time(),
@@ -220,7 +224,7 @@ class DownloadScheduler:
         
         # Start scheduler if not running
         if success and not self.scheduler_running:
-            await self.start_scheduler()
+            await self.start_scheduler(client)
         
         return success
     

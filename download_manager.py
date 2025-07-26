@@ -8,9 +8,9 @@ from utils import parse_telegram_url, get_file_extension_from_message, get_file_
 
 # Configuration variables (will be imported from main)
 CUSTOM_TEMP_DIR = os.getenv("CUSTOM_TEMP_DIR")
-CHUNK_SIZE_MIN = 2 * 1024 * 1024          # 2MB minimum chunk
-CHUNK_SIZE_DEFAULT = 5 * 1024 * 1024       # 5MB default chunk
-CHUNK_SIZE_MAX = 50 * 1024 * 1024         # 50MB maximum chunk (memory limit safe)
+CHUNK_SIZE_MIN = 1 * 1024 * 1024          # 1MB minimum chunk (optimized)
+CHUNK_SIZE_DEFAULT = 2 * 1024 * 1024       # 2MB default chunk (optimized)
+CHUNK_SIZE_MAX = 4 * 1024 * 1024           # 4MB maximum chunk (optimized)
 CHUNK_SIZE_ADAPTIVE = True                 # Enable adaptive chunk sizing
 MAX_MEMORY_PER_DOWNLOAD = 150 * 1024 * 1024  # 150MB max memory per download
 
@@ -60,6 +60,90 @@ async def chunked_stream_to_storage(client, message, filename: str, total_size: 
     print("🔄 Falling back to standard chunked download with temp file...")
     return await standard_download_upload(client, message, filename, upload_func)
 
+async def download_with_retry(client, message, file_path, max_retries=3):
+    """Download with retry logic for file reference errors"""
+    for attempt in range(max_retries):
+        try:
+            print(f"📥 Download attempt {attempt + 1}/{max_retries}")
+            await client.download_media(message, file=file_path)
+            print(f"✅ Download successful on attempt {attempt + 1}")
+            return
+        except Exception as e:
+            if "FileReferenceExpiredError" in str(e) or "file reference has expired" in str(e).lower():
+                print(f"⚠️ File reference expired on attempt {attempt + 1}, need fresh message")
+                if attempt < max_retries - 1:
+                    # Get fresh message for retry
+                    try:
+                        fresh_message = await client.get_messages(message.chat_id, ids=message.id)
+                        if fresh_message:
+                            message = fresh_message
+                            print(f"🔄 Got fresh message, retrying download...")
+                            continue
+                    except Exception as fetch_error:
+                        print(f"❌ Failed to get fresh message: {fetch_error}")
+                raise e
+            else:
+                print(f"❌ Download failed with non-reference error: {e}")
+                raise e
+    
+    raise Exception(f"Download failed after {max_retries} attempts")
+
+async def download_with_adaptive_chunking_and_retry(client, message, file_path, max_retries=3):
+    """Download with adaptive chunking and retry logic for file reference errors"""
+    for attempt in range(max_retries):
+        try:
+            print(f"📥 Adaptive download attempt {attempt + 1}/{max_retries}")
+            await download_with_adaptive_chunking(client, message, file_path)
+            print(f"✅ Adaptive download successful on attempt {attempt + 1}")
+            return
+        except Exception as e:
+            if "FileReferenceExpiredError" in str(e) or "file reference has expired" in str(e).lower():
+                print(f"⚠️ File reference expired during adaptive download on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    # Get fresh message for retry
+                    try:
+                        fresh_message = await client.get_messages(message.chat_id, ids=message.id)
+                        if fresh_message:
+                            message = fresh_message
+                            print(f"🔄 Got fresh message for adaptive download, retrying...")
+                            # Remove partial file if it exists
+                            if os.path.exists(file_path):
+                                os.unlink(file_path)
+                            continue
+                    except Exception as fetch_error:
+                        print(f"❌ Failed to get fresh message for adaptive download: {fetch_error}")
+                raise e
+            else:
+                print(f"❌ Adaptive download failed with non-reference error: {e}")
+                raise e
+    
+    raise Exception(f"Adaptive download failed after {max_retries} attempts")
+
+async def get_fresh_message_and_download(client, channel, msg_id, filename: str, upload_func) -> str:
+    """
+    Fetch fresh message just-in-time and download immediately.
+    This is the core solution to file reference expiration.
+    """
+    print(f"🔄 Getting fresh message for msg_id: {msg_id}")
+    
+    try:
+        # Get fresh message with current file reference
+        fresh_message = await client.get_messages(channel, ids=msg_id)
+        if not fresh_message:
+            raise Exception(f"Message {msg_id} not found")
+        
+        if not fresh_message.video and not fresh_message.document:
+            raise Exception(f"No video or document in message {msg_id}")
+        
+        print(f"✅ Got fresh message, starting download immediately...")
+        
+        # Use the existing download/upload logic with fresh message
+        return await standard_download_upload(client, fresh_message, filename, upload_func)
+        
+    except Exception as e:
+        print(f"❌ Fresh message download failed: {e}")
+        raise e
+
 async def standard_download_upload(client, message, filename: str, upload_func) -> str:
     """
     Standard download/upload method for smaller files that fit in memory.
@@ -99,11 +183,11 @@ async def standard_download_upload(client, message, filename: str, upload_func) 
         
         print(f"⬇️ Downloading to: {temp_path}")
         
-        # Download with adaptive chunking
+        # Download with adaptive chunking and file reference error handling
         if CHUNK_SIZE_ADAPTIVE:
-            await download_with_adaptive_chunking(client, message, temp_path)
+            await download_with_adaptive_chunking_and_retry(client, message, temp_path)
         else:
-            await client.download_media(message, file=temp_path)
+            await download_with_retry(client, message, temp_path)
         
         print(f"✅ Download complete, uploading to storage...")
         
@@ -229,7 +313,8 @@ async def stream_telegram_chunks(client, message, chunk_size: int):
         print(f"❌ Error streaming chunks from Telegram: {e}")
         raise e
     
-    print(f"✅ Finished streaming {chunk_count} chunks, total: {total_downloaded / (1024*1024):.1f} MB")
+        
+        print(f"✅ Finished streaming {chunk_count} chunks, total: {total_downloaded / (1024*1024):.1f} MB")
 
 # Season download functions
 async def process_season_downloads(season_download_queue, client, upload_func, database_load_func, database_save_func, check_file_exists_func, MAX_ACCESS_COUNT):

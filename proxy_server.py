@@ -51,9 +51,9 @@ TEMP_DIR = os.path.join(os.getcwd(), "tmp")
 STREAMING_BUFFER_SIZE = 10 * 1024 * 1024  # 10MB buffer before starting stream
 
 # Memory-optimized chunk sizing for Render's 512MB limit
-CHUNK_SIZE_MIN = 2 * 1024 * 1024          # 2MB minimum chunk
-CHUNK_SIZE_DEFAULT = 5 * 1024 * 1024       # 5MB default chunk
-CHUNK_SIZE_MAX = 100 * 1024 * 1024         # 100MB maximum chunk (memory limit safe)
+CHUNK_SIZE_MIN = 1 * 1024 * 1024          # 1MB minimum chunk (optimized from 2MB)
+CHUNK_SIZE_DEFAULT = 2 * 1024 * 1024       # 2MB default chunk (optimized from 5MB)  
+CHUNK_SIZE_MAX = 4 * 1024 * 1024           # 4MB maximum chunk (optimized from 100MB)
 CHUNK_SIZE_ADAPTIVE = True                 # Enable adaptive chunk sizing
 
 # Memory safety limits for Render free tier
@@ -138,7 +138,7 @@ async def startup_event():
         print("⏰ Started periodic cleanup task (runs every 6 hours)")
         
         # Initialize download scheduler
-        await download_scheduler.start_scheduler()
+        await download_scheduler.start_scheduler(client)
         print("✅ Download scheduler started with 4 slots: 3 LOW priority + 1 HIGH priority")
         
     except Exception as e:

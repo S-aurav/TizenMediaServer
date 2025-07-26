@@ -12,14 +12,14 @@ class DownloadPriority(Enum):
 @dataclass
 class DownloadTask:
     msg_id: int
-    channel: Any
-    message: Any
+    channel: Any  # Channel entity or username/ID
     filename: str
     priority: DownloadPriority
     created_at: float
     series_name: Optional[str] = None
     season_name: Optional[str] = None
     episode_title: Optional[str] = None
+    # Note: No message object stored - we'll fetch fresh messages just-in-time
 
 class QueueManager:
     def __init__(self, max_low_priority_downloads: int = 3, max_high_priority_downloads: int = 1):

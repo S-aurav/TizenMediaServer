@@ -757,6 +757,12 @@ var state = {
   intervals: {
     nextEpisodeProgress: null,
     monitorDownload: null
+  },
+  // Download monitoring control
+  downloadMonitoring: {
+    active: false,
+    cancelled: false,
+    episodeMsgId: null
   }
 };
 
@@ -1434,14 +1440,32 @@ function downloadEpisode(episode) {
 function monitorSingleEpisodeDownload(episode, msgId) {
   debug("👁️ Starting download monitoring for episode: " + episode.title);
   
+  // Set up monitoring state
+  state.downloadMonitoring.active = true;
+  state.downloadMonitoring.cancelled = false;
+  state.downloadMonitoring.episodeMsgId = msgId;
+  
   // Show progress modal
   showLoadingModal("Downloading Episode", "Preparing download progress...");
   
   var checkInterval = setInterval(function() {
+    // Check if monitoring was cancelled by user
+    if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+      debug("🚫 Download monitoring cancelled by user");
+      clearInterval(checkInterval);
+      return;
+    }
+    
     // Get real download progress from server
     fetch(SERVER + "/download/real_progress/" + msgId)
       .then(function(response) { return response.json(); })
       .then(function(progressData) {
+        // Check again if monitoring was cancelled during the request
+        if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+          debug("🚫 Download monitoring cancelled during request");
+          return;
+        }
+        
         debug("📊 Progress: " + JSON.stringify(progressData));
         
         if (progressData.status === "downloading" && progressData.temp_file_found) {
@@ -1456,10 +1480,12 @@ function monitorSingleEpisodeDownload(episode, msgId) {
         } else if (progressData.status === "not_downloading") {
           // Download might be completed, check episode status
           clearInterval(checkInterval);
+          state.downloadMonitoring.active = false;
           checkEpisodeDownloadCompletion(episode);
           
         } else if (progressData.status === "error") {
           clearInterval(checkInterval);
+          state.downloadMonitoring.active = false;
           showLoadingModal("Download Error", progressData.error || "Unknown error occurred");
           setTimeout(function() {
             hideLoadingModal();
@@ -1469,23 +1495,41 @@ function monitorSingleEpisodeDownload(episode, msgId) {
       })
       .catch(function(error) {
         debug("❌ Error monitoring progress: " + error.message);
-        // Continue monitoring despite errors
+        // Continue monitoring despite errors (don't stop unless cancelled)
       });
   }, 5000); // Check every 5 seconds
   
+  // Store interval for cleanup
+  state.intervals.monitorDownload = checkInterval;
+  
   // Stop monitoring after 30 minutes (very large files)
   setTimeout(function() {
-    clearInterval(checkInterval);
-    checkEpisodeDownloadCompletion(episode);
+    if (checkInterval === state.intervals.monitorDownload) {
+      clearInterval(checkInterval);
+      state.downloadMonitoring.active = false;
+      checkEpisodeDownloadCompletion(episode);
+    }
   }, 1800000); // 30 minutes
 }
 
 function checkEpisodeDownloadCompletion(episode) {
   debug("🔍 Checking episode completion: " + episode.title);
   
+  // Only proceed if monitoring is still active and not cancelled
+  if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+    debug("🚫 Download completion check cancelled by user");
+    return;
+  }
+  
   // Refresh episodes to see if download completed
   fetchEpisodes().then(function(episodes) {
     state.episodeList = episodes;
+    
+    // Check again if monitoring was cancelled during the request
+    if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+      debug("🚫 Download completion check cancelled during episode fetch");
+      return;
+    }
     
     // Find the episode in the updated list
     var updatedEpisode = null;
@@ -1732,6 +1776,13 @@ function cleanupIntervals() {
     state.videoPlayer.downloadProgress.progressInterval = null;
   }
   
+  // Cancel any active download monitoring
+  if (state.downloadMonitoring.active) {
+    debug("🚫 Cleaning up - cancelling download monitoring");
+    state.downloadMonitoring.cancelled = true;
+    state.downloadMonitoring.active = false;
+  }
+  
   // Clear key repeat timer
   if (state.keyRepeat.timer) {
     clearTimeout(state.keyRepeat.timer);
@@ -1802,6 +1853,13 @@ function aggressiveStateReset() {
       downloadStartTime: null
     };
   }
+  
+  // Reset download monitoring state
+  state.downloadMonitoring = {
+    active: false,
+    cancelled: false,
+    episodeMsgId: null
+  };
   
   // Clear any lingering DOM states
   clearDOMStates();
@@ -2184,6 +2242,20 @@ function handleKey(code) {
   if (state.loadingVisible) {
     if (code === 10009) { // Back button - cancel loading
       debug("🚫 User cancelled loading");
+      
+      // Cancel download monitoring if active
+      if (state.downloadMonitoring.active) {
+        debug("🚫 Cancelling download monitoring");
+        state.downloadMonitoring.cancelled = true;
+        state.downloadMonitoring.active = false;
+        
+        // Clear monitoring interval
+        if (state.intervals.monitorDownload) {
+          clearInterval(state.intervals.monitorDownload);
+          state.intervals.monitorDownload = null;
+        }
+      }
+      
       hideLoadingModal();
     }
     return;
