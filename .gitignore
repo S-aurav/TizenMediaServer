@@ -131,6 +131,7 @@ downloaded_episodes.json
 .idea/
 *.swp
 *.swo
+.github/
 
 # OS
 .DS_Store
