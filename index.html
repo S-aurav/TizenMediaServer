@@ -675,7 +675,7 @@
 </div>
 
 <script>
-var SERVER = "http://192.168.0.102:8000";
+var SERVER = "https://tizenmediaserver.onrender.com";
 // Performance monitoring
 var debugPerformance = function(operation, startTime) {
   var endTime = performance.now();
@@ -1280,9 +1280,7 @@ function startVideoPlayback(episode, videoUrl) {
     debug("🚀 Opening video URL");
     avplay.open(videoUrl);
     
-    // Set display method to letterbox to maintain aspect ratio
-    debug("🖥️ Setting display method");
-    avplay.setDisplayMethod("PLAYER_DISPLAY_MODE_LETTER_BOX");
+    // Don't set display method here - wait until after prepare
     
     // Set up event listeners
     avplay.setListener({
@@ -1308,6 +1306,12 @@ function startVideoPlayback(episode, videoUrl) {
         debug("🔄 Player state: " + playerState);
         state.videoPlayer.playing = (playerState === "PLAYING");
         updatePlayPauseButton();
+      },
+      onsubtitlechange: function(duration, text, data3, data4) {
+        // Handle subtitle changes if needed
+      },
+      ondrminfo: function(drmInfo) {
+        // Handle DRM info if needed
       }
     });
     
@@ -1315,6 +1319,9 @@ function startVideoPlayback(episode, videoUrl) {
     avplay.prepareAsync(function() {
       try {
         debug("🎬 Video prepared successfully");
+        
+        // Set optimal display method based on video properties
+        setOptimalDisplayMethod(avplay);
         
         // Get video duration
         try {
@@ -1356,6 +1363,106 @@ function startVideoPlayback(episode, videoUrl) {
   } catch (error) {
     debug("❌ Error starting video: " + error.message);
     stopVideo();
+  }
+}
+
+function setOptimalDisplayMethod(avplay) {
+  try {
+    debug("🎯 Setting aspect ratio preservation mode");
+    
+    // First, try to set display rectangle to full screen
+    try {
+      avplay.setDisplayRect(0, 0, 1920, 1080);
+      debug("✅ Display rectangle set to full screen");
+    } catch (rectError) {
+      debug("⚠️ Could not set display rectangle: " + rectError.message);
+    }
+    
+    // Try different display methods - Samsung TVs can be picky
+    var displayMethods = [
+      "PLAYER_DISPLAY_MODE_LETTER_BOX",
+      "PLAYER_DISPLAY_MODE_ORIGIN_SIZE", 
+      "PLAYER_DISPLAY_MODE_AUTO_ASPECT_RATIO",
+      "PLAYER_DISPLAY_MODE_DST_ROI"
+    ];
+    
+    var methodSet = false;
+    
+    // Try each method until one works
+    for (var i = 0; i < displayMethods.length; i++) {
+      try {
+        var method = displayMethods[i];
+        debug("🔄 Trying display method: " + method);
+        avplay.setDisplayMethod(method);
+        debug("✅ Successfully set display method: " + method);
+        methodSet = true;
+        
+        // If LETTER_BOX works, that's our preferred method
+        if (method === "PLAYER_DISPLAY_MODE_LETTER_BOX") {
+          break;
+        }
+      } catch (methodError) {
+        debug("⚠️ Method " + displayMethods[i] + " failed: " + methodError.message);
+        continue;
+      }
+    }
+    
+    if (!methodSet) {
+      debug("❌ All display methods failed, trying one more fallback");
+      // Last resort - try without any parameters
+      try {
+        avplay.setDisplayMethod();
+        debug("✅ Set display method with no parameters (default)");
+      } catch (defaultError) {
+        debug("❌ Even default display method failed: " + defaultError.message);
+      }
+    }
+    
+    // Get video stream info for debugging
+    try {
+      var streamInfo = avplay.getStreamInfo();
+      debug("🔍 Stream info: " + JSON.stringify(streamInfo));
+      
+      var videoWidth = 1920;  // Default values
+      var videoHeight = 1080;
+      
+      // Extract video dimensions from stream info
+      if (streamInfo && streamInfo.video) {
+        if (streamInfo.video.Width) videoWidth = streamInfo.video.Width;
+        if (streamInfo.video.Height) videoHeight = streamInfo.video.Height;
+      } else if (streamInfo && streamInfo.length > 0) {
+        // Sometimes stream info is an array
+        for (var i = 0; i < streamInfo.length; i++) {
+          var stream = streamInfo[i];
+          if (stream.type === 'VIDEO' || stream.Type === 'VIDEO') {
+            if (stream.Width || stream.width) videoWidth = stream.Width || stream.width;
+            if (stream.Height || stream.height) videoHeight = stream.Height || stream.height;
+            break;
+          }
+        }
+      }
+      
+      // Calculate video aspect ratio for debugging
+      var videoAspectRatio = videoWidth / videoHeight;
+      var tvAspectRatio = 16 / 9;
+      
+      debug("📐 Video: " + videoWidth + "x" + videoHeight + " (AR: " + videoAspectRatio.toFixed(3) + ")");
+      debug("📺 TV AR: " + tvAspectRatio.toFixed(3));
+      
+      if (videoAspectRatio < tvAspectRatio) {
+        debug("📱 4:3 or taller video detected - should show with side black bars");
+      } else if (videoAspectRatio > tvAspectRatio) {
+        debug("🎬 Wide video detected - should show with top/bottom black bars");
+      } else {
+        debug("📺 16:9 video detected - should fill screen without stretching");
+      }
+      
+    } catch (infoError) {
+      debug("⚠️ Could not get stream info for debugging: " + infoError.message);
+    }
+    
+  } catch (error) {
+    debug("❌ Error in setOptimalDisplayMethod: " + error.message);
   }
 }
 

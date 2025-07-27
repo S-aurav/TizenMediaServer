@@ -220,6 +220,13 @@
       max-width: 400px;
       width: 80%;
       border: 2px solid white;
+      transition: all 0.3s ease;
+    }
+
+    .modal-content.card-focused {
+      border-color: #ff6b6b;
+      box-shadow: 0 0 20px rgba(255, 107, 107, 0.3);
+      transform: scale(1.02);
     }
 
     .modal-title {
@@ -668,7 +675,7 @@
 </div>
 
 <script>
-var SERVER = "http://192.168.0.102:8000";
+var SERVER = "https://tizenmediaserver.onrender.com";
 // Performance monitoring
 var debugPerformance = function(operation, startTime) {
   var endTime = performance.now();
@@ -698,7 +705,8 @@ var state = {
   selectedEpisode: 0,
   focusMode: "card", // "card" or "button"
   modalVisible: false,
-  modalSelectedButton: 0, // 0 for Download, 1 for Cancel
+  modalSelectedButton: -1, // -1 = card focus, 0 = Download button, 1 = Cancel button
+  modalFocus: "card", // "card", "download", "cancel"
   enterKeyPressed: false,
   enterKeyTimer: null,
   longPressThreshold: 500, // 0.5 second for long press
@@ -749,6 +757,12 @@ var state = {
   intervals: {
     nextEpisodeProgress: null,
     monitorDownload: null
+  },
+  // Download monitoring control
+  downloadMonitoring: {
+    active: false,
+    cancelled: false,
+    episodeMsgId: null
   }
 };
 
@@ -901,42 +915,16 @@ function renderSeasons() {
     seasonCard.className = "season-card" + (i === state.selectedSeason ? ' selected' : '');
     seasonCard.innerHTML = '<span>' + season + '</span>';
     
-    // Add long press detection for download modal
+    // Simple click handler - no long press detection for mouse
     (function(index) {
-      var longPressTimer = null;
-      var longPressActive = false;
-      
-      seasonCard.addEventListener('mousedown', function() {
-        longPressActive = false;
-        longPressTimer = setTimeout(function() {
-          longPressActive = true;
-          state.selectedSeason = index;
-          showSeasonDownloadModal();
-        }, 1000);
-      });
-      
-      seasonCard.addEventListener('mouseup', function() {
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-        
-        if (!longPressActive) {
-          // Regular click - navigate to episodes with state reset
-          state.selectedSeason = index;
-          state.selectedEpisode = 0;
-          // Reset state before navigating to episodes
-          aggressiveStateReset();
-          renderEpisodes();
-        }
-      });
-      
-      seasonCard.addEventListener('mouseleave', function() {
-        if (longPressTimer) {
-          clearTimeout(longPressTimer);
-          longPressTimer = null;
-        }
-        longPressActive = false;
+      seasonCard.addEventListener('click', function() {
+        // Regular click - navigate to episodes with state reset
+        state.selectedSeason = index;
+        state.selectedEpisode = 0;
+        debug("🔄 Click - going to episodes for: " + state.seasonList[index]);
+        // Reset state before navigating to episodes
+        aggressiveStateReset();
+        renderEpisodes();
       });
     })(i);
     
@@ -954,11 +942,15 @@ async function renderEpisodes() {
   state.selectedEpisode = 0;
   state.focusMode = "card";
 
+  // Check queue status first
+  checkQueueStatus();
+
   var episodes = await fetchEpisodes();
 
   var container = document.getElementById("app");
   container.innerHTML = 
     '<div class="title">🎬 Episodes</div>' +
+    '<div id="queueStatus" style="margin-bottom: 20px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; display: none;"></div>' +
     '<div class="episode-grid" id="episode-list"></div>';
 
   var list = document.getElementById("episode-list");
@@ -1007,6 +999,40 @@ async function renderEpisodes() {
   scrollIntoViewIfNeeded(".episode-grid", state.selectedEpisode);
   
   debug("🎬 Episodes rendered with aggressive state reset");
+}
+
+function checkQueueStatus() {
+  fetch(SERVER + "/queue/status")
+    .then(function(response) { return response.json(); })
+    .then(function(queueData) {
+      var queueStatusDiv = document.getElementById("queueStatus");
+      if (!queueStatusDiv) return;
+      
+      var totalQueued = queueData.high_priority_queue + queueData.low_priority_queue;
+      var activeDownloads = queueData.active_downloads;
+      
+      if (totalQueued > 0 || activeDownloads > 0) {
+        var statusText = "";
+        if (activeDownloads > 0) {
+          statusText += "🔄 " + activeDownloads + " download(s) in progress";
+        }
+        if (totalQueued > 0) {
+          if (statusText) statusText += " • ";
+          statusText += "⏳ " + totalQueued + " episode(s) queued";
+          if (queueData.high_priority_queue > 0) {
+            statusText += " (" + queueData.high_priority_queue + " high priority)";
+          }
+        }
+        
+        queueStatusDiv.innerHTML = statusText;
+        queueStatusDiv.style.display = "block";
+      } else {
+        queueStatusDiv.style.display = "none";
+      }
+    })
+    .catch(function(error) {
+      debug("❌ Error checking queue status: " + error.message);
+    });
 }
 
 // Helper function to escape HTML for security
@@ -1119,9 +1145,15 @@ async function playEpisode(episode) {
     }
     
     var streamData = await response.json();
+    
+    if (!streamData.success) {
+      throw new Error("Failed to get stream URL: " + (streamData.error || "Unknown error"));
+    }
+    
     var streamUrl = streamData.stream_url;
     
     debug("📡 Got PixelDrain URL: " + streamUrl);
+    debug("📊 Access count: " + streamData.access_count + "/" + (streamData.access_count + streamData.remaining_access));
     hideLoadingModal();
     
     // Use AVPlay for Smart TV playback
@@ -1140,27 +1172,44 @@ async function playEpisode(episode) {
     debug("❌ Error: " + error.message);
     hideLoadingModal();
     
-    // Check if this episode is actually downloaded
-    debug("🔍 Checking episode download status...");
-    if (!episode.downloaded) {
-      debug("⚠️ Episode shows as not downloaded, triggering download");
-      downloadEpisode(episode);
-      return;
+    // Check specific error types
+    if (error.message.includes("404")) {
+      debug("⚠️ Episode not found - may not be uploaded yet");
+      showLoadingModal("Episode Not Ready", "Episode may not be uploaded yet. Try downloading it first.");
+      setTimeout(function() {
+        hideLoadingModal();
+        renderEpisodes();
+      }, 3000);
+    } else if (error.message.includes("410")) {
+      debug("⚠️ Episode access limit exceeded");
+      showLoadingModal("Access Limit Exceeded", "This episode has been accessed too many times and was deleted. Download again if needed.");
+      setTimeout(function() {
+        hideLoadingModal();
+        renderEpisodes();
+      }, 3000);
+    } else {
+      // Check if this episode is actually downloaded
+      debug("🔍 Checking episode download status...");
+      if (!episode.downloaded) {
+        debug("⚠️ Episode shows as not downloaded, triggering download");
+        downloadEpisode(episode);
+        return;
+      }
+      
+      // Show detailed error to user
+      showLoadingModal("Error", "Failed to load video: " + error.message);
+      setTimeout(function() {
+        hideLoadingModal();
+        // Refresh episodes to update status
+        renderEpisodes();
+      }, 3000);
     }
-    
-    // Show detailed error to user
-    showLoadingModal("Error", "Failed to load video. Check server logs for details.");
-    setTimeout(function() {
-      hideLoadingModal();
-      // Refresh episodes to update status
-      renderEpisodes();
-    }, 3000);
   }
 }
 
 function startVideoPlayback(episode, videoUrl) {
   debug("🎬 Starting video playback for: " + episode.title);
-  debug("� Video URL: " + videoUrl);
+  debug("  Video URL: " + videoUrl);
   
   try {
     // Clean up any existing video
@@ -1231,9 +1280,7 @@ function startVideoPlayback(episode, videoUrl) {
     debug("🚀 Opening video URL");
     avplay.open(videoUrl);
     
-    // Set display method to letterbox to maintain aspect ratio
-    debug("🖥️ Setting display method");
-    avplay.setDisplayMethod("PLAYER_DISPLAY_MODE_LETTER_BOX");
+    // Don't set display method here - wait until after prepare
     
     // Set up event listeners
     avplay.setListener({
@@ -1259,6 +1306,12 @@ function startVideoPlayback(episode, videoUrl) {
         debug("🔄 Player state: " + playerState);
         state.videoPlayer.playing = (playerState === "PLAYING");
         updatePlayPauseButton();
+      },
+      onsubtitlechange: function(duration, text, data3, data4) {
+        // Handle subtitle changes if needed
+      },
+      ondrminfo: function(drmInfo) {
+        // Handle DRM info if needed
       }
     });
     
@@ -1266,6 +1319,9 @@ function startVideoPlayback(episode, videoUrl) {
     avplay.prepareAsync(function() {
       try {
         debug("🎬 Video prepared successfully");
+        
+        // Set optimal display method based on video properties
+        setOptimalDisplayMethod(avplay);
         
         // Get video duration
         try {
@@ -1310,8 +1366,108 @@ function startVideoPlayback(episode, videoUrl) {
   }
 }
 
+function setOptimalDisplayMethod(avplay) {
+  try {
+    debug("🎯 Setting aspect ratio preservation mode");
+    
+    // First, try to set display rectangle to full screen
+    try {
+      avplay.setDisplayRect(0, 0, 1920, 1080);
+      debug("✅ Display rectangle set to full screen");
+    } catch (rectError) {
+      debug("⚠️ Could not set display rectangle: " + rectError.message);
+    }
+    
+    // Try different display methods - Samsung TVs can be picky
+    var displayMethods = [
+      "PLAYER_DISPLAY_MODE_LETTER_BOX",
+      "PLAYER_DISPLAY_MODE_ORIGIN_SIZE", 
+      "PLAYER_DISPLAY_MODE_AUTO_ASPECT_RATIO",
+      "PLAYER_DISPLAY_MODE_DST_ROI"
+    ];
+    
+    var methodSet = false;
+    
+    // Try each method until one works
+    for (var i = 0; i < displayMethods.length; i++) {
+      try {
+        var method = displayMethods[i];
+        debug("🔄 Trying display method: " + method);
+        avplay.setDisplayMethod(method);
+        debug("✅ Successfully set display method: " + method);
+        methodSet = true;
+        
+        // If LETTER_BOX works, that's our preferred method
+        if (method === "PLAYER_DISPLAY_MODE_LETTER_BOX") {
+          break;
+        }
+      } catch (methodError) {
+        debug("⚠️ Method " + displayMethods[i] + " failed: " + methodError.message);
+        continue;
+      }
+    }
+    
+    if (!methodSet) {
+      debug("❌ All display methods failed, trying one more fallback");
+      // Last resort - try without any parameters
+      try {
+        avplay.setDisplayMethod();
+        debug("✅ Set display method with no parameters (default)");
+      } catch (defaultError) {
+        debug("❌ Even default display method failed: " + defaultError.message);
+      }
+    }
+    
+    // Get video stream info for debugging
+    try {
+      var streamInfo = avplay.getStreamInfo();
+      debug("🔍 Stream info: " + JSON.stringify(streamInfo));
+      
+      var videoWidth = 1920;  // Default values
+      var videoHeight = 1080;
+      
+      // Extract video dimensions from stream info
+      if (streamInfo && streamInfo.video) {
+        if (streamInfo.video.Width) videoWidth = streamInfo.video.Width;
+        if (streamInfo.video.Height) videoHeight = streamInfo.video.Height;
+      } else if (streamInfo && streamInfo.length > 0) {
+        // Sometimes stream info is an array
+        for (var i = 0; i < streamInfo.length; i++) {
+          var stream = streamInfo[i];
+          if (stream.type === 'VIDEO' || stream.Type === 'VIDEO') {
+            if (stream.Width || stream.width) videoWidth = stream.Width || stream.width;
+            if (stream.Height || stream.height) videoHeight = stream.Height || stream.height;
+            break;
+          }
+        }
+      }
+      
+      // Calculate video aspect ratio for debugging
+      var videoAspectRatio = videoWidth / videoHeight;
+      var tvAspectRatio = 16 / 9;
+      
+      debug("📐 Video: " + videoWidth + "x" + videoHeight + " (AR: " + videoAspectRatio.toFixed(3) + ")");
+      debug("📺 TV AR: " + tvAspectRatio.toFixed(3));
+      
+      if (videoAspectRatio < tvAspectRatio) {
+        debug("📱 4:3 or taller video detected - should show with side black bars");
+      } else if (videoAspectRatio > tvAspectRatio) {
+        debug("🎬 Wide video detected - should show with top/bottom black bars");
+      } else {
+        debug("📺 16:9 video detected - should fill screen without stretching");
+      }
+      
+    } catch (infoError) {
+      debug("⚠️ Could not get stream info for debugging: " + infoError.message);
+    }
+    
+  } catch (error) {
+    debug("❌ Error in setOptimalDisplayMethod: " + error.message);
+  }
+}
+
 function stopVideo() {
-  debug("� Stopping video playback");
+  debug("  Stopping video playback");
   
   if (typeof webapis !== 'undefined' && webapis.avplay) {
     try {
@@ -1343,30 +1499,181 @@ function stopVideo() {
 
 function downloadEpisode(episode) {
   debug("⬇️ Downloading episode: " + episode.title);
-  showLoadingModal("Starting Download", "Uploading to PixelDrain...");
+  showLoadingModal("Starting Download", "Queuing download...");
   
   fetch(SERVER + "/download?url=" + encodeURIComponent(episode.url))
     .then(function(res) { return res.json(); })
     .then(function(data) {
-      if (data.status === "uploading" || data.status === "already_uploaded") {
-        debug("✅ Download/upload started");
-        hideLoadingModal();
-        // Refresh episodes to show updated status
-        setTimeout(function() { renderEpisodes(); }, 1000);
+      debug("📡 Download response: " + JSON.stringify(data));
+      
+      if (data.status === "already_uploaded") {
+        debug("✅ Episode already available");
+        showLoadingModal("Already Available", "Episode is ready to stream!");
+        setTimeout(function() {
+          hideLoadingModal();
+          renderEpisodes(); // Refresh to show updated status
+        }, 2000);
+      } else if (data.status === "queued") {
+        debug("✅ Download queued successfully");
+        var priorityText = data.priority === "HIGH" ? "high priority" : "standard priority";
+        showLoadingModal("Download Queued", 
+          "Episode queued for download (" + priorityText + "). Position: " + data.queue_position);
+        setTimeout(function() {
+          hideLoadingModal();
+          // Start monitoring download progress
+          monitorSingleEpisodeDownload(episode, data.msg_id);
+        }, 3000);
+      } else if (data.status === "already_queued") {
+        debug("⚠️ Download already in progress");
+        showLoadingModal("Already Downloading", "This episode is already being downloaded.");
+        setTimeout(function() {
+          hideLoadingModal();
+          // Monitor existing download
+          monitorSingleEpisodeDownload(episode, data.msg_id);
+        }, 2000);
       } else {
         debug("❌ Download failed: " + JSON.stringify(data));
-        hideLoadingModal();
+        showLoadingModal("Download Failed", data.message || "Failed to start download");
+        setTimeout(function() { hideLoadingModal(); }, 3000);
       }
     })
     .catch(function(err) {
       debug("❌ Error: " + err.message);
-      hideLoadingModal();
+      showLoadingModal("Connection Error", "Failed to connect to server");
+      setTimeout(function() { hideLoadingModal(); }, 3000);
     });
+}
+
+function monitorSingleEpisodeDownload(episode, msgId) {
+  debug("👁️ Starting download monitoring for episode: " + episode.title);
+  
+  // Set up monitoring state
+  state.downloadMonitoring.active = true;
+  state.downloadMonitoring.cancelled = false;
+  state.downloadMonitoring.episodeMsgId = msgId;
+  
+  // Show progress modal
+  showLoadingModal("Downloading Episode", "Preparing download progress...");
+  
+  var checkInterval = setInterval(function() {
+    // Check if monitoring was cancelled by user
+    if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+      debug("🚫 Download monitoring cancelled by user");
+      clearInterval(checkInterval);
+      return;
+    }
+    
+    // Get real download progress from server
+    fetch(SERVER + "/download/real_progress/" + msgId)
+      .then(function(response) { return response.json(); })
+      .then(function(progressData) {
+        // Check again if monitoring was cancelled during the request
+        if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+          debug("🚫 Download monitoring cancelled during request");
+          return;
+        }
+        
+        debug("📊 Progress: " + JSON.stringify(progressData));
+        
+        if (progressData.status === "downloading" && progressData.temp_file_found) {
+          // Update progress display
+          var percentage = progressData.percentage || 0;
+          var downloadedMB = (progressData.downloaded_size / (1024*1024)).toFixed(1);
+          var totalMB = (progressData.total_size / (1024*1024)).toFixed(1);
+          
+          showLoadingModal("Downloading Episode", 
+            "Progress: " + percentage.toFixed(1) + "% (" + downloadedMB + "/" + totalMB + " MB)");
+          
+        } else if (progressData.status === "not_downloading") {
+          // Download might be completed, check episode status
+          clearInterval(checkInterval);
+          state.downloadMonitoring.active = false;
+          checkEpisodeDownloadCompletion(episode);
+          
+        } else if (progressData.status === "error") {
+          clearInterval(checkInterval);
+          state.downloadMonitoring.active = false;
+          showLoadingModal("Download Error", progressData.error || "Unknown error occurred");
+          setTimeout(function() {
+            hideLoadingModal();
+            renderEpisodes();
+          }, 3000);
+        }
+      })
+      .catch(function(error) {
+        debug("❌ Error monitoring progress: " + error.message);
+        // Continue monitoring despite errors (don't stop unless cancelled)
+      });
+  }, 5000); // Check every 5 seconds
+  
+  // Store interval for cleanup
+  state.intervals.monitorDownload = checkInterval;
+  
+  // Stop monitoring after 30 minutes (very large files)
+  setTimeout(function() {
+    if (checkInterval === state.intervals.monitorDownload) {
+      clearInterval(checkInterval);
+      state.downloadMonitoring.active = false;
+      checkEpisodeDownloadCompletion(episode);
+    }
+  }, 1800000); // 30 minutes
+}
+
+function checkEpisodeDownloadCompletion(episode) {
+  debug("🔍 Checking episode completion: " + episode.title);
+  
+  // Only proceed if monitoring is still active and not cancelled
+  if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+    debug("🚫 Download completion check cancelled by user");
+    return;
+  }
+  
+  // Refresh episodes to see if download completed
+  fetchEpisodes().then(function(episodes) {
+    state.episodeList = episodes;
+    
+    // Check again if monitoring was cancelled during the request
+    if (state.downloadMonitoring.cancelled || !state.downloadMonitoring.active) {
+      debug("🚫 Download completion check cancelled during episode fetch");
+      return;
+    }
+    
+    // Find the episode in the updated list
+    var updatedEpisode = null;
+    for (var i = 0; i < episodes.length; i++) {
+      if (episodes[i].msg_id === episode.msg_id) {
+        updatedEpisode = episodes[i];
+        break;
+      }
+    }
+    
+    if (updatedEpisode && updatedEpisode.downloaded) {
+      debug("✅ Episode download completed!");
+      showLoadingModal("Download Complete", "Episode is ready to stream!");
+      setTimeout(function() {
+        hideLoadingModal();
+        renderEpisodes();
+      }, 2000);
+    } else {
+      debug("⚠️ Episode still not ready, may still be uploading");
+      showLoadingModal("Upload in Progress", "Episode downloaded, uploading to cloud storage...");
+      setTimeout(function() {
+        hideLoadingModal();
+        renderEpisodes();
+      }, 3000);
+    }
+  }).catch(function(error) {
+    debug("❌ Error checking completion: " + error.message);
+    hideLoadingModal();
+    renderEpisodes();
+  });
 }
 
 function showSeasonDownloadModal() {
   var series = state.seriesList[state.selectedSeries];
   var season = state.seasonList[state.selectedSeason];
+  
+  debug("📋 Showing season download modal for: " + series.name + " - " + season);
   
   document.getElementById("modalTitle").textContent = "Download Season";
   document.getElementById("modalMessage").textContent = 
@@ -1375,35 +1682,79 @@ function showSeasonDownloadModal() {
   var modal = document.getElementById("confirmModal");
   modal.classList.add("show");
   state.modalVisible = true;
-  state.modalSelectedButton = 0;
+  
+  // Start with card focus - no buttons active
+  state.modalFocus = "card";
+  state.modalSelectedButton = -1;
   state.seasonDownload.seriesName = series.name;
   state.seasonDownload.seasonName = season;
+  
+  // Update buttons to show card focus initially
   updateModalButtons();
   
-  // Set a flag to prevent immediate modal closure
-  state.seasonDownload.justOpened = true;
-  setTimeout(function() {
-    state.seasonDownload.justOpened = false;
-  }, 200); // 200ms delay to prevent immediate closure
+  debug("🎯 Modal opened with CARD focus - use arrows to select buttons");
+  debug("✅ Season download modal shown");
 }
 
 function hideSeasonDownloadModal() {
+  debug("🔒 Hiding season download modal");
   var modal = document.getElementById("confirmModal");
   modal.classList.remove("show");
+  
+  // Reset modal state properly but preserve season download data for the download function
   state.modalVisible = false;
+  state.modalFocus = "card";
+  state.modalSelectedButton = -1;
+  // Don't clear seriesName and seasonName here - they're needed for downloadWholeSeason
+  
+  // Remove card focus styling
+  var modalContent = document.querySelector(".modal-content");
+  if (modalContent) {
+    modalContent.classList.remove("card-focused");
+  }
+  
+  debug("✅ Modal state reset - modalVisible: " + state.modalVisible + ", focus: " + state.modalFocus);
+  debug("🔍 Season data preserved - series: " + state.seasonDownload.seriesName + ", season: " + state.seasonDownload.seasonName);
 }
 
 function downloadWholeSeason() {
+  debug("🚀 downloadWholeSeason() function called - KEYBOARD ENTRY POINT");
   var seriesName = state.seasonDownload.seriesName;
   var seasonName = state.seasonDownload.seasonName;
   
-  debug("⬇️ Starting season download: " + seasonName);
+  debug("🔍 State check - seriesName: " + seriesName + ", seasonName: " + seasonName);
+  debug("🔍 Modal state - modalVisible: " + state.modalVisible + ", selectedButton: " + state.modalSelectedButton);
   
-  fetch(SERVER + "/download/season?series_name=" + encodeURIComponent(seriesName) + "&season_name=" + encodeURIComponent(seasonName), {
+  if (!seriesName || !seasonName) {
+    debug("❌ Missing series or season name");
+    showLoadingModal("Error", "Missing series or season information");
+    setTimeout(function() { hideLoadingModal(); }, 3000);
+    return;
+  }
+  
+  debug("📋 Series: " + seriesName + ", Season: " + seasonName);
+  debug("⬇️ Starting season download: " + seasonName + " from " + seriesName);
+  showLoadingModal("Starting Season Download", "Preparing to download all episodes...");
+  
+  // Create URL with query parameters for the POST request
+  var url = SERVER + "/download/season?series_name=" + encodeURIComponent(seriesName) + "&season_name=" + encodeURIComponent(seasonName);
+  
+  debug("📤 URL: " + url);
+  debug("🌐 Server URL: " + SERVER + "/download/season");
+  
+  fetch(url, {
     method: 'POST'
   })
-  .then(function(response) { return response.json(); })
+  .then(function(response) {
+    debug("📡 Season download response status: " + response.status);
+    if (!response.ok) {
+      throw new Error("Server error: " + response.status);
+    }
+    return response.json();
+  })
   .then(function(result) {
+    debug("📡 Season download result: " + JSON.stringify(result));
+    
     if (result.status === "already_downloaded") {
       debug("✅ All episodes already downloaded");
       showLoadingModal("Already Downloaded", "All episodes are already available!");
@@ -1414,19 +1765,29 @@ function downloadWholeSeason() {
         }
       }, 2000);
     } else if (result.status === "queued") {
-      debug("✅ Season download started in background: " + seasonName);
-      // Show brief notification and continue using the app
-      showLoadingModal("Background Download Started", 
-        "Season '" + seasonName + "' is downloading in background (" + result.episodes_to_download + " episodes). You can continue using the app.");
+      debug("✅ Season download queued in background: " + seasonName);
+      var message = "Season '" + seasonName + "' queued for download (" + result.episodes_to_download + " episodes). " +
+                   "Downloads will start after single episode requests. You can continue using the app.";
+      showLoadingModal("Background Download Queued", message);
       setTimeout(function() {
         hideLoadingModal();
-        // Don't store season_id since we're not tracking progress in UI
-      }, 3000);
+        // Refresh episodes if we're in episodes view
+        if (state.view === "episodes") {
+          setTimeout(function() {
+            renderEpisodes();
+          }, 1000);
+        }
+      }, 4000);
+    } else {
+      debug("❌ Unexpected status: " + result.status);
+      var errorMsg = result.message || "Unexpected response: " + result.status;
+      showLoadingModal("Error", errorMsg);
+      setTimeout(function() { hideLoadingModal(); }, 3000);
     }
   })
   .catch(function(error) {
     debug("❌ Season download error: " + error.message);
-    showLoadingModal("Error", "Failed to start season download");
+    showLoadingModal("Error", "Failed to start season download: " + error.message);
     setTimeout(function() { hideLoadingModal(); }, 3000);
   });
 }
@@ -1434,13 +1795,28 @@ function downloadWholeSeason() {
 function updateModalButtons() {
   var confirmBtn = document.getElementById("confirmBtn");
   var cancelBtn = document.getElementById("cancelBtn");
+  var modalContent = document.querySelector(".modal-content");
   
-  if (state.modalSelectedButton === 0) {
+  debug("🔘 Updating modal buttons, focus: " + state.modalFocus);
+  
+  // Reset all states first
+  confirmBtn.classList.remove("selected");
+  cancelBtn.classList.remove("selected");
+  modalContent.classList.remove("card-focused");
+  
+  if (state.modalFocus === "download") {
     confirmBtn.classList.add("selected");
-    cancelBtn.classList.remove("selected");
-  } else {
-    confirmBtn.classList.remove("selected");
+    state.modalSelectedButton = 0;
+    debug("✅ Download button focused");
+  } else if (state.modalFocus === "cancel") {
     cancelBtn.classList.add("selected");
+    state.modalSelectedButton = 1;
+    debug("❌ Cancel button focused");
+  } else {
+    // Card focus
+    modalContent.classList.add("card-focused");
+    state.modalSelectedButton = -1;
+    debug("🎯 Card focused - no button selected");
   }
 }
 
@@ -1507,6 +1883,13 @@ function cleanupIntervals() {
     state.videoPlayer.downloadProgress.progressInterval = null;
   }
   
+  // Cancel any active download monitoring
+  if (state.downloadMonitoring.active) {
+    debug("🚫 Cleaning up - cancelling download monitoring");
+    state.downloadMonitoring.cancelled = true;
+    state.downloadMonitoring.active = false;
+  }
+  
   // Clear key repeat timer
   if (state.keyRepeat.timer) {
     clearTimeout(state.keyRepeat.timer);
@@ -1540,15 +1923,18 @@ function aggressiveStateReset() {
   
   // Reset modal states
   state.modalVisible = false;
-  state.modalSelectedButton = 0;
+  state.modalFocus = "card";
+  state.modalSelectedButton = -1;
   state.loadingVisible = false;
   
-  // Reset season download state
-  state.seasonDownload = {
-    seriesName: null,
-    seasonName: null,
-    justOpened: false
-  };
+  // Reset season download state (but preserve data if modal is visible)
+  if (!state.modalVisible) {
+    state.seasonDownload = {
+      seriesName: null,
+      seasonName: null,
+      justOpened: false
+    };
+  }
   
   // Reset key states
   state.enterKeyPressed = false;
@@ -1574,6 +1960,13 @@ function aggressiveStateReset() {
       downloadStartTime: null
     };
   }
+  
+  // Reset download monitoring state
+  state.downloadMonitoring = {
+    active: false,
+    cancelled: false,
+    episodeMsgId: null
+  };
   
   // Clear any lingering DOM states
   clearDOMStates();
@@ -1915,25 +2308,38 @@ function handleKey(code) {
   
   // Handle modal navigation
   if (state.modalVisible) {
-    // Don't handle Enter key if modal was just opened
-    if (code === 13 && state.seasonDownload.justOpened) {
-      return;
-    }
+    debug("🔑 Modal key handler - code: " + code + ", focus: " + state.modalFocus);
+    debug("🔍 Modal visibility: " + state.modalVisible + ", view: " + state.view);
     
-    if (code === 37) { // Left arrow
-      state.modalSelectedButton = 0; // Download
+    if (code === 37) { // Left arrow - move to Download button
+      debug("⬅️ Left arrow - focusing Download button");
+      state.modalFocus = "download";
       updateModalButtons();
-    } else if (code === 39) { // Right arrow
-      state.modalSelectedButton = 1; // Cancel
+    } else if (code === 39) { // Right arrow - move to Cancel button
+      debug("➡️ Right arrow - focusing Cancel button");
+      state.modalFocus = "cancel";
       updateModalButtons();
-    } else if (code === 13) { // Enter
-      if (state.modalSelectedButton === 0) {
+    } else if (code === 38 || code === 40) { // Up/Down arrows - back to card focus
+      debug("⬆️⬇️ Up/Down arrow - focusing back to card");
+      state.modalFocus = "card";
+      updateModalButtons();
+    } else if (code === 13) { // Enter key
+      debug("🔑 ENTER KEY DETECTED in modal!");
+      debug("🎯 Current focus: " + state.modalFocus);
+      
+      if (state.modalFocus === "download") {
+        debug("✅ Download button focused - STARTING SEASON DOWNLOAD");
         hideSeasonDownloadModal();
         downloadWholeSeason();
-      } else {
+      } else if (state.modalFocus === "cancel") {
+        debug("❌ Cancel button focused - closing modal");
         hideSeasonDownloadModal();
+      } else {
+        debug("🎯 Card focused - Enter key ignored (no action)");
+        // Do nothing when card is focused and Enter is pressed
       }
     } else if (code === 10009) { // Back button
+      debug("🔙 Back button - hiding modal");
       hideSeasonDownloadModal();
     }
     return;
@@ -1943,6 +2349,20 @@ function handleKey(code) {
   if (state.loadingVisible) {
     if (code === 10009) { // Back button - cancel loading
       debug("🚫 User cancelled loading");
+      
+      // Cancel download monitoring if active
+      if (state.downloadMonitoring.active) {
+        debug("🚫 Cancelling download monitoring");
+        state.downloadMonitoring.cancelled = true;
+        state.downloadMonitoring.active = false;
+        
+        // Clear monitoring interval
+        if (state.intervals.monitorDownload) {
+          clearInterval(state.intervals.monitorDownload);
+          state.intervals.monitorDownload = null;
+        }
+      }
+      
       hideLoadingModal();
     }
     return;
@@ -2050,16 +2470,10 @@ function handleKeyDown(code) {
   if (state.view === "seasons" && code === 13 && !state.enterKeyPressed) {
     state.enterKeyPressed = true;
     state.enterKeyTimer = setTimeout(function() {
-      // Long press detected
-      debug("Long press detected - showing download dialog");
+      // Long press detected - ONLY show modal, don't download
+      debug("🎯 Long press detected - showing modal ONLY (no auto-download)");
       showSeasonDownloadModal();
       state.enterKeyPressed = false;
-      
-      // Set a flag to prevent immediate modal closure
-      state.seasonDownload.justOpened = true;
-      setTimeout(function() {
-        state.seasonDownload.justOpened = false;
-      }, 100); // 100ms delay to prevent immediate closure
     }, state.longPressThreshold);
     return;
   }
@@ -2092,16 +2506,13 @@ function handleKeyUp(code) {
     }
     state.enterKeyPressed = false;
     
-    // Don't navigate if modal was just opened
-    if (state.seasonDownload.justOpened) {
-      return;
+    // Short press - go to episodes (only if modal is not visible)
+    if (!state.modalVisible) {
+      state.selectedEpisode = 0;
+      // Aggressive state reset before navigating to episodes
+      aggressiveStateReset();
+      renderEpisodes();
     }
-    
-    // Short press - go to episodes
-    state.selectedEpisode = 0;
-    // Aggressive state reset before navigating to episodes
-    aggressiveStateReset();
-    renderEpisodes();
     return;
   }
 
@@ -2537,11 +2948,13 @@ function fallbackProgressEstimation(nextEpisode) {
 document.addEventListener("DOMContentLoaded", function() {
   // Season download confirmation buttons
   document.getElementById("confirmBtn").addEventListener("click", function() {
+    debug("🖱️ Confirm button clicked via mouse");
     hideSeasonDownloadModal();
     downloadWholeSeason();
   });
   
   document.getElementById("cancelBtn").addEventListener("click", function() {
+    debug("🖱️ Cancel button clicked via mouse");
     hideSeasonDownloadModal();
   });
   
@@ -2554,6 +2967,8 @@ document.addEventListener("DOMContentLoaded", function() {
   if (typeof tizen !== "undefined" && tizen.tvinputdevice) {
     tizen.tvinputdevice.registerKey("Return");
   }
+  
+  debug("✅ Event listeners attached successfully");
 });
 
 // Key listeners - ECMA 3 compatible
@@ -2564,8 +2979,9 @@ window.addEventListener("keydown", function(e) {
 window.addEventListener("keyup", function(e) {
   handleKeyUp(e.keyCode);
   
-  // For non-Enter keys, use the regular handler
-  if (e.keyCode !== 13 || state.view !== "seasons") {
+  // Always call handleKey for modal interactions
+  // Only skip Enter key processing for seasons view when modal is NOT visible
+  if (e.keyCode !== 13 || state.view !== "seasons" || state.modalVisible) {
     handleKey(e.keyCode);
   }
 });
