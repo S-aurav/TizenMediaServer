@@ -1,0 +1,399 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Mobile/PC Streaming Client</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: rgba(255, 255, 255, 0.1);
+            backdrop-filter: blur(10px);
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 8px 32px rgba(31, 38, 135, 0.37);
+        }
+
+        h1 {
+            text-align: center;
+            font-size: 2.5em;
+            margin-bottom: 30px;
+            text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
+        }
+
+        .series-grid, .season-grid, .episode-grid {
+            display: grid;
+            gap: 20px;
+            margin-top: 20px;
+        }
+
+        .series-grid {
+            grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+        }
+
+        .season-grid {
+            grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
+        }
+
+        .episode-grid {
+            grid-template-columns: 1fr;
+        }
+
+        .card {
+            background: rgba(255, 255, 255, 0.2);
+            border-radius: 15px;
+            padding: 20px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            border: 2px solid transparent;
+        }
+
+        .card:hover {
+            transform: translateY(-5px);
+            box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            border-color: rgba(255, 255, 255, 0.3);
+        }
+
+        .series-card img {
+            width: 100%;
+            height: 300px;
+            object-fit: cover;
+            border-radius: 10px;
+            margin-bottom: 15px;
+        }
+
+        .episode-card {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 25px;
+        }
+
+        .episode-info {
+            flex: 1;
+        }
+
+        .episode-title {
+            font-size: 1.4em;
+            font-weight: bold;
+            margin-bottom: 10px;
+        }
+
+        .episode-meta {
+            font-size: 0.9em;
+            opacity: 0.8;
+            margin: 5px 0;
+        }
+
+        .stream-status {
+            padding: 8px 16px;
+            border-radius: 20px;
+            font-size: 0.9em;
+            font-weight: bold;
+            margin: 5px 0;
+        }
+
+        .status-downloaded {
+            background: #4CAF50;
+            color: white;
+        }
+
+        .status-progressive {
+            background: #FF9800;
+            color: white;
+        }
+
+        .play-button {
+            background: linear-gradient(45deg, #FF6B6B, #4ECDC4);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 25px;
+            font-size: 1.1em;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+        }
+
+        .play-button:hover {
+            transform: scale(1.05);
+            box-shadow: 0 6px 20px rgba(0,0,0,0.3);
+        }
+
+        .back-button {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+            border: 2px solid rgba(255, 255, 255, 0.3);
+            padding: 10px 20px;
+            border-radius: 10px;
+            cursor: pointer;
+            margin-bottom: 20px;
+            display: inline-block;
+            text-decoration: none;
+            transition: all 0.3s ease;
+        }
+
+        .back-button:hover {
+            background: rgba(255, 255, 255, 0.3);
+            transform: translateX(-5px);
+        }
+
+        .loading {
+            text-align: center;
+            padding: 50px;
+            font-size: 1.2em;
+        }
+
+        .error {
+            background: rgba(244, 67, 54, 0.2);
+            border: 2px solid #f44336;
+            border-radius: 10px;
+            padding: 20px;
+            margin: 20px 0;
+            text-align: center;
+        }
+
+        .video-container {
+            position: relative;
+            width: 100%;
+            max-width: 800px;
+            margin: 20px auto;
+            background: #000;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+
+        video {
+            width: 100%;
+            height: auto;
+        }
+
+        .video-controls {
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            background: linear-gradient(transparent, rgba(0,0,0,0.8));
+            padding: 20px;
+            color: white;
+        }
+
+        @media (max-width: 768px) {
+            .container {
+                padding: 15px;
+                margin: 10px;
+            }
+
+            .episode-card {
+                flex-direction: column;
+                text-align: center;
+            }
+
+            .play-button {
+                margin-top: 15px;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 Mobile/PC Streaming</h1>
+        <div id="content">
+            <div class="loading">Loading series...</div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = 'http://192.168.0.102:8000';
+        let currentView = 'series';
+        let currentSeries = '';
+        let currentSeason = '';
+
+        // Load series on page load
+        document.addEventListener('DOMContentLoaded', loadSeries);
+
+        async function loadSeries() {
+            try {
+                showLoading('Loading series...');
+                const response = await fetch(`${API_BASE}/catalog/series`);
+                const series = await response.json();
+                
+                displaySeries(series);
+            } catch (error) {
+                showError('Failed to load series: ' + error.message);
+            }
+        }
+
+        async function loadSeasons(seriesName) {
+            try {
+                showLoading('Loading seasons...');
+                currentSeries = seriesName;
+                const response = await fetch(`${API_BASE}/catalog/series/${encodeURIComponent(seriesName)}`);
+                const seasons = await response.json();
+                
+                displaySeasons(seasons, seriesName);
+            } catch (error) {
+                showError('Failed to load seasons: ' + error.message);
+            }
+        }
+
+        async function loadEpisodes(seriesName, seasonName) {
+            try {
+                showLoading('Loading episodes...');
+                currentSeason = seasonName;
+                const response = await fetch(`${API_BASE}/catalog/series/${encodeURIComponent(seriesName)}/${encodeURIComponent(seasonName)}`);
+                const episodes = await response.json();
+                
+                displayEpisodes(episodes, seriesName, seasonName);
+            } catch (error) {
+                showError('Failed to load episodes: ' + error.message);
+            }
+        }
+
+        function displaySeries(series) {
+            currentView = 'series';
+            const content = document.getElementById('content');
+            
+            const html = `
+                <div class="series-grid">
+                    ${series.map(s => `
+                        <div class="card series-card" onclick="loadSeasons('${s.name}')">
+                            <img src="${API_BASE}${s.poster}" alt="${s.name}" onerror="this.src='data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMjAwIiBoZWlnaHQ9IjMwMCIgeG1sbnM9Imh0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnIj48cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjY2NjIi8+PHRleHQgeD0iNTAlIiB5PSI1MCUiIGZvbnQtZmFtaWx5PSJBcmlhbCIgZm9udC1zaXplPSIxNCIgZmlsbD0iIzk5OSIgdGV4dC1hbmNob3I9Im1pZGRsZSIgZHk9Ii4zZW0iPk5vIEltYWdlPC90ZXh0Pjwvc3ZnPg=='">
+                            <div style="font-size: 1.2em; font-weight: bold; text-align: center;">${s.name}</div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+            
+            content.innerHTML = html;
+        }
+
+        function displaySeasons(seasons, seriesName) {
+            currentView = 'seasons';
+            const content = document.getElementById('content');
+            
+            const html = `
+                <button class="back-button" onclick="loadSeries()">← Back to Series</button>
+                <h2>📺 ${seriesName}</h2>
+                <div class="season-grid">
+                    ${seasons.map(season => `
+                        <div class="card" onclick="loadEpisodes('${seriesName}', '${season}')">
+                            <div style="font-size: 1.3em; font-weight: bold; text-align: center;">
+                                ${season}
+                            </div>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+            
+            content.innerHTML = html;
+        }
+
+        function displayEpisodes(episodes, seriesName, seasonName) {
+            currentView = 'episodes';
+            const content = document.getElementById('content');
+            
+            const html = `
+                <button class="back-button" onclick="loadSeasons('${seriesName}')">← Back to Seasons</button>
+                <h2>🎬 ${seriesName} - ${seasonName}</h2>
+                <div class="episode-grid">
+                    ${episodes.map(episode => `
+                        <div class="card episode-card">
+                            <div class="episode-info">
+                                <div class="episode-title">${episode.title}</div>
+                                <div class="episode-meta">Episode ID: ${episode.msg_id}</div>
+                                <div class="stream-status ${episode.downloaded ? 'status-downloaded' : 'status-progressive'}">
+                                    ${episode.downloaded ? 
+                                        `📡 Ready (${episode.access_count || 0} views, ${episode.remaining_access || 'N/A'} remaining)` : 
+                                        '📥 Progressive Stream Available'}
+                                </div>
+                            </div>
+                            <button class="play-button" onclick="playEpisode('${episode.msg_id}', '${episode.title}', ${episode.downloaded})">
+                                ${episode.downloaded ? '▶️ Play' : '📥 Stream'}
+                            </button>
+                        </div>
+                    `).join('')}
+                </div>
+            `;
+            
+            content.innerHTML = html;
+        }
+
+        async function playEpisode(msgId, title, isDownloaded) {
+            try {
+                showLoading(`${isDownloaded ? 'Getting stream URL...' : 'Starting progressive stream...'}`);
+                
+                const response = await fetch(`${API_BASE}/mobile/stream/${msgId}`);
+                const streamData = await response.json();
+                
+                if (streamData.success) {
+                    showVideoPlayer(streamData.stream_url, title, streamData);
+                } else {
+                    showError('Failed to get stream: ' + (streamData.error || 'Unknown error'));
+                }
+            } catch (error) {
+                showError('Failed to start stream: ' + error.message);
+            }
+        }
+
+        function showVideoPlayer(streamUrl, title, streamData) {
+            const content = document.getElementById('content');
+            
+            const html = `
+                <button class="back-button" onclick="loadEpisodes('${currentSeries}', '${currentSeason}')">← Back to Episodes</button>
+                <h2>🎬 ${title}</h2>
+                <div class="video-container">
+                    <video controls autoplay>
+                        <source src="${streamUrl}" type="video/x-matroska">
+                        <source src="${streamUrl}" type="video/mp4">
+                        Your browser does not support the video tag.
+                    </video>
+                    <div class="video-controls">
+                        <div style="font-size: 1.1em; margin-bottom: 10px;">${title}</div>
+                        <div style="font-size: 0.9em; opacity: 0.8;">
+                            ${streamData.stream_type === 'pixeldrain' ? 
+                                `📡 Streaming from PixelDrain Cache` : 
+                                '📥 Progressive stream (downloading while playing)'}
+                        </div>
+                    </div>
+                </div>
+                <div style="margin-top: 20px; padding: 15px; background: rgba(255,255,255,0.1); border-radius: 10px;">
+                    <h3>💡 Streaming Info</h3>
+                    <p><strong>Type:</strong> ${streamData.stream_type === 'pixeldrain' ? 'PixelDrain Cache' : 'Progressive Download'}</p>
+                    <p><strong>Status:</strong> ${streamData.message}</p>
+                    ${streamData.access_count ? `<p><strong>Total Views:</strong> ${streamData.access_count}</p>` : ''}
+                    ${streamData.file_size ? `<p><strong>File Size:</strong> ${(streamData.file_size / (1024*1024)).toFixed(1)} MB</p>` : ''}
+                </div>
+            `;
+            
+            content.innerHTML = html;
+        }
+
+        function showLoading(message) {
+            const content = document.getElementById('content');
+            content.innerHTML = `<div class="loading">${message}</div>`;
+        }
+
+        function showError(message) {
+            const content = document.getElementById('content');
+            content.innerHTML = `
+                <div class="error">
+                    <h3>❌ Error</h3>
+                    <p>${message}</p>
+                    <button class="back-button" onclick="loadSeries()">← Back to Series</button>
+                </div>
+            `;
+        }
+    </script>
+</body>
+</html>

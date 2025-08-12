@@ -32,6 +32,8 @@
       padding: 60px;
       height: 100vh;
       box-sizing: border-box;
+      display: flex;
+      flex-direction: column;
     }
 
     .title {
@@ -40,6 +42,7 @@
       text-align: center;
       color: #ff6b6b;
       text-shadow: 2px 2px 4px rgba(0,0,0,0.8);
+      flex-shrink: 0;
     }
 
     /* POSTER Cards */
@@ -47,9 +50,30 @@
       display: flex;
       flex-wrap: wrap;
       gap: 20px;
-      justify-content: center;
+      justify-content: flex-start;
       overflow-y: auto;
-      max-height: auto;
+      overflow-x: hidden;
+      max-height: calc(100vh - 200px);
+      padding: 10px;
+      scroll-behavior: smooth;
+    }
+
+    .poster-grid::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .poster-grid::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+    }
+
+    .poster-grid::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.3);
+      border-radius: 4px;
+    }
+
+    .poster-grid::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.5);
     }
 
     .poster-card {
@@ -77,9 +101,30 @@
       display: flex;
       flex-wrap: wrap;
       gap: 20px;
-      justify-content: center;
+      justify-content: flex-start;
       overflow-y: auto;
-      max-height: none;
+      overflow-x: hidden;
+      max-height: calc(100vh - 200px);
+      padding: 10px;
+      scroll-behavior: smooth;
+    }
+
+    .season-grid::-webkit-scrollbar {
+      width: 8px;
+    }
+
+    .season-grid::-webkit-scrollbar-track {
+      background: rgba(255, 255, 255, 0.1);
+      border-radius: 4px;
+    }
+
+    .season-grid::-webkit-scrollbar-thumb {
+      background: rgba(255, 255, 255, 0.3);
+      border-radius: 4px;
+    }
+
+    .season-grid::-webkit-scrollbar-thumb:hover {
+      background: rgba(255, 255, 255, 0.5);
     }
 
     .season-card {
@@ -675,7 +720,7 @@
 </div>
 
 <script>
-var SERVER = "https://tizenmediaserver.onrender.com";
+var SERVER = "http://192.168.0.102:8000";
 // Performance monitoring
 var debugPerformance = function(operation, startTime) {
   var endTime = performance.now();
@@ -894,6 +939,19 @@ function renderLanding() {
   debug("📺 Landing rendered with aggressive state reset");
 }
 
+function updateSeriesSelection() {
+  // Update only the selection without re-rendering the entire page
+  var posterCards = document.querySelectorAll('.poster-card');
+  for (var i = 0; i < posterCards.length; i++) {
+    var card = posterCards[i];
+    if (i === state.selectedSeries) {
+      card.classList.add('selected');
+    } else {
+      card.classList.remove('selected');
+    }
+  }
+}
+
 function renderSeasons() {
   // Aggressive reset before rendering seasons
   aggressiveStateReset();
@@ -932,6 +990,19 @@ function renderSeasons() {
   }
   
   debug("🎞️ Seasons rendered with aggressive state reset");
+}
+
+function updateSeasonSelection() {
+  // Update only the selection without re-rendering the entire page
+  var seasonCards = document.querySelectorAll('.season-card');
+  for (var i = 0; i < seasonCards.length; i++) {
+    var card = seasonCards[i];
+    if (i === state.selectedSeason) {
+      card.classList.add('selected');
+    } else {
+      card.classList.remove('selected');
+    }
+  }
 }
 
 async function renderEpisodes() {
@@ -1840,8 +1911,49 @@ function hideLoadingModal() {
 function scrollIntoViewIfNeeded(containerSelector, index) {
   var container = document.querySelector(containerSelector);
   if (!container) return;
+  
   var item = container.children[index];
-  if (item) item.scrollIntoView({ behavior: "smooth", block: "nearest", inline: "nearest" });
+  if (!item) return;
+  
+  // Get container and item dimensions
+  var containerRect = container.getBoundingClientRect();
+  var itemRect = item.getBoundingClientRect();
+  
+  // Calculate if item is visible within container
+  var isItemAboveContainer = itemRect.top < containerRect.top;
+  var isItemBelowContainer = itemRect.bottom > containerRect.bottom;
+  
+  if (isItemAboveContainer || isItemBelowContainer) {
+    // Item is not fully visible, scroll to it
+    item.scrollIntoView({ 
+      behavior: "smooth", 
+      block: "center", 
+      inline: "nearest" 
+    });
+  }
+}
+
+function autoScrollToSelectedItem(containerSelector, index) {
+  var container = document.querySelector(containerSelector);
+  if (!container) return;
+  
+  var item = container.children[index];
+  if (!item) return;
+  
+  // For grid layouts, we need to ensure the selected item is visible
+  var containerRect = container.getBoundingClientRect();
+  var itemRect = item.getBoundingClientRect();
+  
+  // Check if item is outside visible area
+  var scrollThreshold = 100; // pixels from edge to trigger scroll
+  
+  if (itemRect.top < containerRect.top + scrollThreshold) {
+    // Item is too close to top, scroll up
+    container.scrollTop -= (containerRect.top + scrollThreshold - itemRect.top);
+  } else if (itemRect.bottom > containerRect.bottom - scrollThreshold) {
+    // Item is too close to bottom, scroll down
+    container.scrollTop += (itemRect.bottom - containerRect.bottom + scrollThreshold);
+  }
 }
 
 function goBack() {
@@ -2379,18 +2491,29 @@ function handleKey(code) {
   }
   
   if (state.view === "landing") {
-    if (code === 37) state.selectedSeries = (state.selectedSeries - 1 + state.seriesList.length) % state.seriesList.length;
-    else if (code === 39) state.selectedSeries = (state.selectedSeries + 1) % state.seriesList.length;
-    else if (code === 13) {
+    if (code === 37) {
+      state.selectedSeries = (state.selectedSeries - 1 + state.seriesList.length) % state.seriesList.length;
+      updateSeriesSelection();
+      autoScrollToSelectedItem(".poster-grid", state.selectedSeries);
+    } else if (code === 39) {
+      state.selectedSeries = (state.selectedSeries + 1) % state.seriesList.length;
+      updateSeriesSelection();
+      autoScrollToSelectedItem(".poster-grid", state.selectedSeries);
+    } else if (code === 13) {
       // Aggressive state reset before navigating to seasons
       aggressiveStateReset();
       fetchSeasons();
     }
-    renderLanding();
   } else if (state.view === "seasons") {
-    if (code === 37 || code === 38) state.selectedSeason = (state.selectedSeason - 1 + state.seasonList.length) % state.seasonList.length;
-    else if (code === 39 || code === 40) state.selectedSeason = (state.selectedSeason + 1) % state.seasonList.length;
-    else if (code === 13) {
+    if (code === 37 || code === 38) {
+      state.selectedSeason = (state.selectedSeason - 1 + state.seasonList.length) % state.seasonList.length;
+      updateSeasonSelection();
+      autoScrollToSelectedItem(".season-grid", state.selectedSeason);
+    } else if (code === 39 || code === 40) {
+      state.selectedSeason = (state.selectedSeason + 1) % state.seasonList.length;
+      updateSeasonSelection();
+      autoScrollToSelectedItem(".season-grid", state.selectedSeason);
+    } else if (code === 13) {
       // Handle in keydown/keyup for long press detection
       return;
     }
@@ -2398,7 +2521,6 @@ function handleKey(code) {
       goBack();
       return;
     }
-    renderSeasons();
   } else if (state.view === "episodes") {
     var listLength = state.episodeList.length;
 
@@ -2553,18 +2675,22 @@ function executeFastNavigation(code) {
   if (state.view === "landing") {
     if (code === 37) {
       state.selectedSeries = (state.selectedSeries - 1 + state.seriesList.length) % state.seriesList.length;
-      renderLanding();
+      updateSeriesSelection();
+      autoScrollToSelectedItem(".poster-grid", state.selectedSeries);
     } else if (code === 39) {
       state.selectedSeries = (state.selectedSeries + 1) % state.seriesList.length;
-      renderLanding();
+      updateSeriesSelection();
+      autoScrollToSelectedItem(".poster-grid", state.selectedSeries);
     }
   } else if (state.view === "seasons") {
     if (code === 37 || code === 38) {
       state.selectedSeason = (state.selectedSeason - 1 + state.seasonList.length) % state.seasonList.length;
-      renderSeasons();
+      updateSeasonSelection();
+      autoScrollToSelectedItem(".season-grid", state.selectedSeason);
     } else if (code === 39 || code === 40) {
       state.selectedSeason = (state.selectedSeason + 1) % state.seasonList.length;
-      renderSeasons();
+      updateSeasonSelection();
+      autoScrollToSelectedItem(".season-grid", state.selectedSeason);
     }
   } else if (state.view === "episodes") {
     var listLength = state.episodeList.length;
@@ -2986,8 +3112,37 @@ window.addEventListener("keyup", function(e) {
   }
 });
 
+function refreshVideoData() {
+  debug("🔄 Refreshing video data from server...");
+  
+  return fetch(SERVER + "/refresh/video_data")
+    .then(function(response) { return response.json(); })
+    .then(function(result) {
+      if (result.status === "success") {
+        debug("✅ Video data refreshed: " + result.series_count + " series");
+        // Reload current view
+        if (state.view === "landing") {
+          fetchSeries();
+        } else if (state.view === "seasons") {
+          fetchSeasons();
+        } else if (state.view === "episodes") {
+          fetchEpisodes();
+        }
+        return true;
+      } else {
+        debug("❌ Failed to refresh video data: " + result.message);
+        return false;
+      }
+    })
+    .catch(function(error) {
+      debug("❌ Error refreshing video data: " + error.message);
+      return false;
+    });
+}
+
 // Initialize the app
 fetchSeries();
+refreshVideoData();
 
 </script>
 </body>

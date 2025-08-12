@@ -1,0 +1,524 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PC/Mobile Streaming Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #1a1a1a;
+            color: #ffffff;
+        }
+        .container {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 30px;
+        }
+        .section {
+            background: #2a2a2a;
+            padding: 20px;
+            border-radius: 10px;
+            border: 1px solid #444;
+        }
+        h1, h2 {
+            color: #ff6b6b;
+            margin-top: 0;
+        }
+        .series-list, .season-list, .episode-list {
+            display: none;
+        }
+        .series-list.active, .season-list.active, .episode-list.active {
+            display: block;
+        }
+        .item {
+            background: #333;
+            margin: 10px 0;
+            padding: 15px;
+            border-radius: 5px;
+            cursor: pointer;
+            border: 2px solid transparent;
+            transition: all 0.3s ease;
+        }
+        .item:hover {
+            background: #444;
+            border-color: #ff6b6b;
+        }
+        .item.selected {
+            background: #ff6b6b;
+            color: #000;
+        }
+        .episode-item {
+            position: relative;
+        }
+        .episode-status {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            padding: 5px 10px;
+            border-radius: 15px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+        .status-ready { background: #28a745; color: white; }
+        .status-downloading { background: #ffc107; color: black; }
+        .status-unavailable { background: #dc3545; color: white; }
+        .status-cloud { background: #17a2b8; color: white; }
+        .video-container {
+            margin-top: 20px;
+        }
+        video {
+            width: 100%;
+            max-width: 800px;
+            background: #000;
+            border-radius: 5px;
+        }
+        .episode-info {
+            margin-top: 15px;
+            font-size: 14px;
+            color: #ccc;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            background: #ff6b6b;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 5px;
+            cursor: pointer;
+            margin-right: 10px;
+            transition: background 0.3s ease;
+        }
+        button:hover {
+            background: #ff5252;
+        }
+        button:disabled {
+            background: #666;
+            cursor: not-allowed;
+        }
+        .progress-container {
+            margin: 10px 0;
+            background: #333;
+            border-radius: 10px;
+            overflow: hidden;
+        }
+        .progress-bar {
+            height: 8px;
+            background: linear-gradient(90deg, #ff6b6b, #ff8e53);
+            width: 0%;
+            transition: width 0.3s ease;
+        }
+        .status-info {
+            margin: 10px 0;
+            padding: 10px;
+            background: #333;
+            border-radius: 5px;
+            font-family: monospace;
+            font-size: 12px;
+        }
+        .back-btn {
+            background: #666;
+            margin-bottom: 20px;
+        }
+        .back-btn:hover {
+            background: #777;
+        }
+    </style>
+</head>
+<body>
+    <h1>🎬 PC/Mobile Streaming Interface</h1>
+    
+    <div class="container">
+        <!-- Left Panel: Navigation -->
+        <div class="section">
+            <h2>📺 Browse Content</h2>
+            
+            <!-- Back Button -->
+            <button class="back-btn" id="backBtn" onclick="goBack()" style="display: none;">← Go Back</button>
+            
+            <!-- Series List -->
+            <div class="series-list active" id="seriesList">
+                <h3>Select Series:</h3>
+                <div id="seriesContainer">Loading...</div>
+            </div>
+            
+            <!-- Season List -->
+            <div class="season-list" id="seasonList">
+                <h3 id="seasonTitle">Select Season:</h3>
+                <div id="seasonContainer"></div>
+            </div>
+            
+            <!-- Episode List -->
+            <div class="episode-list" id="episodeList">
+                <h3 id="episodeTitle">Select Episode:</h3>
+                <div id="episodeContainer"></div>
+            </div>
+        </div>
+        
+        <!-- Right Panel: Player -->
+        <div class="section">
+            <h2>▶️ Video Player</h2>
+            
+            <div class="video-container">
+                <video id="videoPlayer" controls style="display: none;">
+                    Your browser does not support the video tag.
+                </video>
+                
+                <div id="videoPlaceholder" style="text-align: center; padding: 50px; background: #333; border-radius: 5px;">
+                    <p>🎬 Select an episode to start streaming</p>
+                </div>
+            </div>
+            
+            <div class="controls">
+                <button onclick="playVideo()" id="playBtn" disabled>▶️ Play</button>
+                <button onclick="pauseVideo()" id="pauseBtn" disabled>⏸️ Pause</button>
+                <button onclick="refreshStatus()" id="refreshBtn" disabled>🔄 Refresh Status</button>
+            </div>
+            
+            <div class="episode-info" id="episodeInfo">
+                <p><strong>Ready to stream!</strong></p>
+                <p>• Select an episode from the left panel</p>
+                <p>• Episodes will download automatically if needed</p>
+                <p>• Streaming starts as soon as enough data is available</p>
+            </div>
+            
+            <div class="progress-container" id="progressContainer" style="display: none;">
+                <div class="progress-bar" id="progressBar"></div>
+            </div>
+            
+            <div class="status-info" id="statusInfo"></div>
+        </div>
+    </div>
+
+    <script>
+        let currentView = 'series'; // 'series', 'seasons', 'episodes'
+        let selectedSeries = null;
+        let selectedSeason = null;
+        let selectedEpisode = null;
+        let statusInterval = null;
+        
+        const API_BASE = window.location.origin;
+        
+        // Initialize
+        document.addEventListener('DOMContentLoaded', function() {
+            loadSeries();
+        });
+        
+        async function loadSeries() {
+            try {
+                const response = await fetch(`${API_BASE}/stream/catalog/series`);
+                const series = await response.json();
+                
+                const container = document.getElementById('seriesContainer');
+                container.innerHTML = '';
+                
+                series.forEach(s => {
+                    const item = document.createElement('div');
+                    item.className = 'item';
+                    item.innerHTML = `
+                        <strong>${s.name}</strong>
+                        <br><small>Click to view seasons</small>
+                    `;
+                    item.onclick = () => selectSeries(s.name);
+                    container.appendChild(item);
+                });
+                
+            } catch (error) {
+                document.getElementById('seriesContainer').innerHTML = 
+                    '<p style="color: #ff6b6b;">Error loading series: ' + error.message + '</p>';
+            }
+        }
+        
+        async function selectSeries(seriesName) {
+            selectedSeries = seriesName;
+            
+            try {
+                const response = await fetch(`${API_BASE}/stream/catalog/series/${encodeURIComponent(seriesName)}`);
+                const seasons = await response.json();
+                
+                document.getElementById('seasonTitle').textContent = `${seriesName} - Select Season:`;
+                const container = document.getElementById('seasonContainer');
+                container.innerHTML = '';
+                
+                seasons.forEach(season => {
+                    const item = document.createElement('div');
+                    item.className = 'item';
+                    item.innerHTML = `
+                        <strong>${season}</strong>
+                        <br><small>Click to view episodes</small>
+                    `;
+                    item.onclick = () => selectSeason(season);
+                    container.appendChild(item);
+                });
+                
+                // Switch to season view
+                switchView('seasons');
+                
+            } catch (error) {
+                alert('Error loading seasons: ' + error.message);
+            }
+        }
+        
+        async function selectSeason(seasonName) {
+            selectedSeason = seasonName;
+            
+            try {
+                const response = await fetch(`${API_BASE}/stream/catalog/series/${encodeURIComponent(selectedSeries)}/${encodeURIComponent(seasonName)}`);
+                const episodes = await response.json();
+                
+                document.getElementById('episodeTitle').textContent = `${selectedSeries} - ${seasonName}:`;
+                const container = document.getElementById('episodeContainer');
+                container.innerHTML = '';
+                
+                episodes.forEach((episode, index) => {
+                    const item = document.createElement('div');
+                    item.className = 'item episode-item';
+                    
+                    // Determine status
+                    let statusClass = 'status-unavailable';
+                    let statusText = 'Not Available';
+                    
+                    if (episode.streamable) {
+                        statusClass = 'status-ready';
+                        statusText = 'Ready';
+                    } else if (episode.downloading) {
+                        statusClass = 'status-downloading';
+                        statusText = `${episode.download_progress}%`;
+                    } else if (episode.cloud_available) {
+                        statusClass = 'status-cloud';
+                        statusText = 'Cloud';
+                    }
+                    
+                    item.innerHTML = `
+                        <div class="episode-status ${statusClass}">${statusText}</div>
+                        <strong>${episode.title}</strong>
+                        <br><small>Episode ${episode.msg_id}</small>
+                        <br><small style="color: #aaa;">
+                            ${episode.streamable ? '✅ Streamable' : 
+                              episode.downloading ? '⬇️ Downloading...' : 
+                              episode.cloud_available ? '☁️ Available in cloud' : '❌ Not available'}
+                        </small>
+                    `;
+                    item.onclick = () => selectEpisode(episode);
+                    container.appendChild(item);
+                });
+                
+                // Switch to episode view
+                switchView('episodes');
+                
+            } catch (error) {
+                alert('Error loading episodes: ' + error.message);
+            }
+        }
+        
+        async function selectEpisode(episode) {
+            selectedEpisode = episode;
+            
+            // Update UI
+            document.querySelectorAll('.episode-item').forEach(item => item.classList.remove('selected'));
+            event.target.closest('.episode-item').classList.add('selected');
+            
+            // Update episode info
+            const info = document.getElementById('episodeInfo');
+            info.innerHTML = `
+                <p><strong>${episode.title}</strong></p>
+                <p><strong>Series:</strong> ${episode.series_name}</p>
+                <p><strong>Season:</strong> ${episode.season_name}</p>
+                <p><strong>Episode ID:</strong> ${episode.msg_id}</p>
+                <p><strong>Status:</strong> ${
+                    episode.streamable ? '✅ Ready to stream' :
+                    episode.downloading ? '⬇️ Downloading...' :
+                    episode.cloud_available ? '☁️ Available in cloud' :
+                    '❌ Not available locally'
+                }</p>
+            `;
+            
+            // Enable controls
+            document.getElementById('playBtn').disabled = false;
+            document.getElementById('refreshBtn').disabled = false;
+            
+            // Start status monitoring
+            if (statusInterval) clearInterval(statusInterval);
+            statusInterval = setInterval(() => refreshStatus(), 3000);
+            
+            // Try to play immediately if ready
+            if (episode.streamable) {
+                await playVideo();
+            } else {
+                await refreshStatus();
+            }
+        }
+        
+        async function playVideo() {
+            if (!selectedEpisode) {
+                alert('Please select an episode first');
+                return;
+            }
+            
+            const videoPlayer = document.getElementById('videoPlayer');
+            const placeholder = document.getElementById('videoPlaceholder');
+            
+            try {
+                // Show loading
+                updateStatus('🎬 Starting stream...');
+                
+                // Try to start streaming
+                const streamUrl = `${API_BASE}/stream/play/${selectedEpisode.msg_id}`;
+                
+                const response = await fetch(streamUrl, { method: 'HEAD' });
+                
+                if (response.status === 202) {
+                    // Not ready yet, need to wait
+                    updateStatus('⬇️ Download starting, please wait...');
+                    document.getElementById('progressContainer').style.display = 'block';
+                    
+                    // Keep checking status
+                    setTimeout(() => refreshStatus(), 2000);
+                    return;
+                }
+                
+                if (response.ok) {
+                    // Ready to stream
+                    videoPlayer.src = streamUrl;
+                    videoPlayer.style.display = 'block';
+                    placeholder.style.display = 'none';
+                    
+                    // Enable controls
+                    document.getElementById('pauseBtn').disabled = false;
+                    
+                    updateStatus('▶️ Streaming...');
+                    
+                    // Hide progress bar
+                    document.getElementById('progressContainer').style.display = 'none';
+                } else {
+                    throw new Error(`Stream not available (${response.status})`);
+                }
+                
+            } catch (error) {
+                updateStatus('❌ Error: ' + error.message);
+            }
+        }
+        
+        function pauseVideo() {
+            const videoPlayer = document.getElementById('videoPlayer');
+            if (videoPlayer.paused) {
+                videoPlayer.play();
+            } else {
+                videoPlayer.pause();
+            }
+        }
+        
+        async function refreshStatus() {
+            if (!selectedEpisode) return;
+            
+            try {
+                const response = await fetch(`${API_BASE}/stream/status/${selectedEpisode.msg_id}`);
+                const status = await response.json();
+                
+                // Update progress bar
+                if (status.downloading && status.download_progress > 0) {
+                    document.getElementById('progressContainer').style.display = 'block';
+                    document.getElementById('progressBar').style.width = status.download_progress + '%';
+                } else if (status.streamable) {
+                    document.getElementById('progressContainer').style.display = 'none';
+                }
+                
+                // Update status info
+                const statusText = `
+                    MSG ID: ${status.msg_id}
+                    Streamable: ${status.streamable ? 'YES' : 'NO'}
+                    Downloading: ${status.downloading ? 'YES' : 'NO'}
+                    Progress: ${status.download_progress.toFixed(1)}%
+                    File Size: ${(status.file_size / 1024 / 1024).toFixed(1)} MB
+                    Available: ${(status.available_size / 1024 / 1024).toFixed(1)} MB
+                    Buffer Req: ${status.buffer_requirement_mb} MB
+                    Local File: ${status.local_file_exists ? 'YES' : 'NO'}
+                    Temp File: ${status.temp_file_exists ? 'YES' : 'NO'}
+                    Download Active: ${status.download_active ? 'YES' : 'NO'}
+                `;
+                
+                updateStatus(statusText);
+                
+                // Auto-play when ready
+                if (status.streamable && !status.local_file_exists && status.temp_file_exists) {
+                    // Temp file is ready for streaming
+                    updateStatus('🎬 Stream ready! Starting playback...');
+                    setTimeout(() => playVideo(), 1000);
+                } else if (status.streamable && status.local_file_exists) {
+                    // Complete file is ready
+                    updateStatus('✅ File complete and ready!');
+                }
+                
+            } catch (error) {
+                updateStatus('❌ Status check failed: ' + error.message);
+            }
+        }
+        
+        function updateStatus(text) {
+            document.getElementById('statusInfo').textContent = text;
+        }
+        
+        function switchView(view) {
+            // Map logical view names to actual element IDs
+            const viewIdMap = {
+                'series': 'seriesList',
+                'seasons': 'seasonList',
+                'episodes': 'episodeList'
+            };
+            // Hide all views
+            document.querySelectorAll('.series-list, .season-list, .episode-list').forEach(el => {
+                el.classList.remove('active');
+            });
+            // Show selected view
+            const id = viewIdMap[view];
+            if (id) {
+                document.getElementById(id).classList.add('active');
+            }
+            // Show/hide back button
+            document.getElementById('backBtn').style.display = view === 'series' ? 'none' : 'inline-block';
+            currentView = view;
+        }
+        
+        function goBack() {
+            if (currentView === 'episodes') {
+                switchView('seasons');
+            } else if (currentView === 'seasons') {
+                switchView('series');
+                selectedSeries = null;
+            }
+            
+            // Clear status monitoring
+            if (statusInterval) {
+                clearInterval(statusInterval);
+                statusInterval = null;
+            }
+            
+            // Reset video
+            const videoPlayer = document.getElementById('videoPlayer');
+            videoPlayer.style.display = 'none';
+            document.getElementById('videoPlaceholder').style.display = 'block';
+            videoPlayer.src = '';
+            
+            // Reset controls
+            document.getElementById('playBtn').disabled = true;
+            document.getElementById('pauseBtn').disabled = true;
+            document.getElementById('refreshBtn').disabled = true;
+            
+            // Reset info
+            document.getElementById('episodeInfo').innerHTML = `
+                <p><strong>Ready to stream!</strong></p>
+                <p>• Select an episode from the left panel</p>
+                <p>• Episodes will download automatically if needed</p>
+                <p>• Streaming starts as soon as enough data is available</p>
+            `;
+            
+            selectedEpisode = null;
+        }
+    </script>
+</body>
+</html>

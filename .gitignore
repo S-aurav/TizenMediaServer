@@ -47,6 +47,9 @@ coverage.xml
 *.cover
 .hypothesis/
 .pytest_cache/
+client/
+tizen player/
+
 
 # Translations
 *.mo
@@ -168,3 +171,17 @@ tizen4_compatible_player.html
 memory_safe_verification_report.md
 backup-keep-alive.yml
 verify_memory_safe.py
+audit_database.py
+cleanup_local_files.py
+compare_data.py
+debug_tv_behavior.py
+GIST_SETUP_GUIDE.md
+setup_gist.py
+test_gist_only.py
+test_gist_setup.py
+test_gist.py
+test_gist_primary.py
+test_httpx.py
+test_simple_gist.py
+test_tv_endpoint.py
+optimize_server.py
