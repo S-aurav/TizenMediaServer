@@ -3,6 +3,7 @@ import json
 import re
 import asyncio
 import tempfile
+import threading
 import time
 from typing import List, Dict, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
@@ -25,6 +26,10 @@ from queue_manager import queue_manager
 # Import Gist functionality
 from gist_manager import GistManager, background_sync_task
 
+
+# Mobile streaming
+mobile_stream_locks = {}  # msg_id -> threading.Lock()
+mobile_stream_status = {}  # msg_id -> status info
 
 # Load environment variables
 load_dotenv()
@@ -115,6 +120,9 @@ async def gist_sync_middleware(request: Request, call_next):
 
 # Static folder for poster images
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Mount mobile webapp files
+app.mount("/mobile", StaticFiles(directory="mobile"), name="mobile")
 
 POSTERS = {
     "Shinchan": "/static/shinchan.jpg",
@@ -1580,6 +1588,388 @@ async def cancel_season_download(season_id: str):
     else:
         raise HTTPException(status_code=404, detail="Season download not found")
 
+
+
+# === Mobile/PC streaming endpoints (Testing) === #
+
+@app.get("/stream_mobile/{msg_id}")
+async def stream_mobile(msg_id: str, request: Request):
+    """
+    Mobile/PC streaming endpoint with improved coordination and VLC compatibility
+    """
+    print(f"📱 Mobile stream request for msg_id: {msg_id}")
+    
+    # Use a lock per msg_id to prevent concurrent download triggers
+    if msg_id not in mobile_stream_locks:
+        mobile_stream_locks[msg_id] = threading.Lock()
+    
+    with mobile_stream_locks[msg_id]:
+        try:
+            # First check if file is already on PixelDrain
+            uploaded_files = load_uploaded_files_db()
+            
+            if str(msg_id) in uploaded_files:
+                file_info = uploaded_files[str(msg_id)]
+                pixeldrain_id = file_info["pixeldrain_id"]
+                
+                # Verify file still exists on PixelDrain
+                if await check_pixeldrain_file_exists(pixeldrain_id):
+                    # Check access count
+                    access_count = file_info.get("access_count", 0)
+                    if access_count < MAX_ACCESS_COUNT:
+                        print(f"📱 File already on PixelDrain, redirecting to direct stream")
+                        
+                        # Increment access count
+                        file_info["access_count"] = access_count + 1
+                        uploaded_files[str(msg_id)] = file_info
+                        save_uploaded_files_db(uploaded_files)
+                        
+                        # Get PixelDrain direct URL
+                        pixeldrain_url = get_pixeldrain_download_url(pixeldrain_id)
+                        
+                        # For mobile/PC, redirect to PixelDrain
+                        from fastapi.responses import RedirectResponse
+                        return RedirectResponse(url=pixeldrain_url, status_code=302)
+                    else:
+                        # File exceeded access limit, remove and continue to download
+                        await delete_from_pixeldrain(pixeldrain_id)
+                        del uploaded_files[str(msg_id)]
+                        save_uploaded_files_db(uploaded_files)
+                else:
+                    # File doesn't exist on PixelDrain anymore, remove from DB
+                    del uploaded_files[str(msg_id)]
+                    save_uploaded_files_db(uploaded_files)
+            
+            # File not on PixelDrain - need to download and stream simultaneously
+            print(f"📱 File not on PixelDrain, starting download and streaming")
+            
+            # Get file info first
+            file_info_response = await get_file_info(msg_id)
+            if file_info_response["status"] != "found":
+                raise HTTPException(404, "Episode not found in catalog")
+            
+            total_file_size = file_info_response["file_size"]
+            filename = file_info_response["filename"]
+            
+            # Check if download is already in progress
+            msg_id_int = int(msg_id)
+            download_in_progress = queue_manager.is_download_in_progress(msg_id_int)
+            
+            # Only trigger download if not already in progress
+            if not download_in_progress and msg_id not in mobile_stream_status:
+                # Trigger download using existing system
+                print(f"📱 Triggering download for streaming: {filename}")
+                
+                # Find the episode URL from video.json
+                episode_url = None
+                with open("video.json", encoding="utf-8") as f:
+                    data = json.load(f)
+                    for series_name, series_data in data.items():
+                        for season_name, episodes in series_data.items():
+                            for episode in episodes:
+                                _, ep_msg_id = parse_telegram_url(episode["url"])
+                                if ep_msg_id == msg_id_int:
+                                    episode_url = episode["url"]
+                                    break
+                            if episode_url:
+                                break
+                        if episode_url:
+                            break
+                
+                if not episode_url:
+                    raise HTTPException(404, "Episode URL not found")
+                
+                # Queue the download (HIGH priority for mobile streaming)
+                try:
+                    await download_scheduler.queue_single_episode_download(episode_url, client)
+                    print(f"📱 Download queued successfully for mobile streaming")
+                    
+                    # Mark as being handled
+                    mobile_stream_status[msg_id] = {
+                        "triggered_at": time.time(),
+                        "total_size": total_file_size,
+                        "filename": filename
+                    }
+                except Exception as e:
+                    print(f"❌ Failed to queue download: {e}")
+                    # Continue anyway, maybe download is already in progress
+            
+            # Stream from temp file with improved coordination
+            return await stream_from_temp_file_improved(msg_id, total_file_size, filename, request)
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"❌ Error in mobile streaming: {e}")
+            raise HTTPException(500, f"Streaming failed: {str(e)}")
+
+async def stream_from_temp_file_improved(msg_id: str, total_file_size: int, filename: str, request: Request):
+    """
+    Improved temp file streaming with better VLC compatibility
+    """
+    print(f"📱 Streaming from temp file: {filename}")
+    
+    # Find temp file
+    temp_file_path = None
+    if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
+        temp_dir = CUSTOM_TEMP_DIR
+    else:
+        import tempfile
+        temp_dir = tempfile.gettempdir()
+    
+    # Look for temp file with longer wait time
+    max_wait_time = 60  # Wait max 60 seconds for download to start
+    wait_time = 0
+    
+    while wait_time < max_wait_time:
+        try:
+            for temp_filename in os.listdir(temp_dir):
+                if f"temp_{msg_id}" in temp_filename:
+                    potential_path = os.path.join(temp_dir, temp_filename)
+                    if os.path.isfile(potential_path):
+                        temp_file_path = potential_path
+                        break
+            
+            if temp_file_path:
+                break
+                
+            # Wait for download to start
+            await asyncio.sleep(2)  # Check every 2 seconds
+            wait_time += 2
+            
+        except Exception as e:
+            print(f"❌ Error looking for temp file: {e}")
+            await asyncio.sleep(2)
+            wait_time += 2
+    
+    if not temp_file_path:
+        raise HTTPException(404, "Download not started or temp file not found")
+    
+    print(f"📱 Found temp file: {temp_file_path}")
+    
+    # Get current file size
+    current_size = os.path.getsize(temp_file_path)
+    
+    # Handle range requests
+    range_header = request.headers.get('range')
+    
+    # For VLC compatibility, we need proper video headers
+    video_headers = {
+        'Content-Type': 'video/mp4',
+        'Accept-Ranges': 'bytes',
+        'Cache-Control': 'no-cache',
+        'Connection': 'keep-alive',
+        # Add CORS headers for better compatibility
+        'Access-Control-Allow-Origin': '*',
+        'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+        'Access-Control-Allow-Headers': 'Range, Content-Range, Content-Length'
+    }
+    
+    if range_header:
+        # Parse range header (e.g., "bytes=0-1023")
+        range_match = re.match(r'bytes=(\d+)-(\d*)', range_header)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2)) if range_match.group(2) else None
+            
+            # Wait for the requested range to be available
+            max_range_wait = 30  # Wait max 30 seconds for range to be available
+            range_wait = 0
+            
+            while start >= current_size and range_wait < max_range_wait:
+                await asyncio.sleep(1)
+                if os.path.exists(temp_file_path):
+                    current_size = os.path.getsize(temp_file_path)
+                range_wait += 1
+            
+            # If we still don't have the data, return what we can
+            if start >= current_size:
+                # Return empty content with proper range headers
+                actual_end = current_size - 1 if current_size > 0 else 0
+                video_headers.update({
+                    'Content-Range': f'bytes {start}-{actual_end}/{total_file_size}',
+                    'Content-Length': '0'
+                })
+                return StreamingResponse(
+                    iter([b'']),  # Empty content
+                    status_code=206,
+                    headers=video_headers
+                )
+            
+            # Calculate actual end position
+            actual_end = min(end or (total_file_size - 1), current_size - 1, total_file_size - 1)
+            content_length = actual_end - start + 1
+            
+            print(f"📱 Streaming range: {start}-{actual_end} (available: {current_size}, total: {total_file_size})")
+            
+            video_headers.update({
+                'Content-Range': f'bytes {start}-{actual_end}/{total_file_size}',
+                'Content-Length': str(content_length)
+            })
+            
+            return StreamingResponse(
+                stream_temp_file_range_improved(temp_file_path, start, actual_end, total_file_size),
+                status_code=206,
+                headers=video_headers
+            )
+    
+    # No range request - stream entire file as it becomes available
+    video_headers['Content-Length'] = str(total_file_size)
+    
+    return StreamingResponse(
+        stream_temp_file_complete_improved(temp_file_path, total_file_size),
+        headers=video_headers
+    )
+
+async def stream_temp_file_range_improved(temp_file_path: str, start: int, end: int, total_size: int):
+    """Improved range streaming with better error handling"""
+    print(f"📱 Streaming range: {start}-{end}")
+    
+    chunk_size = 32 * 1024  # 32KB chunks for smooth streaming
+    current_pos = start
+    
+    try:
+        while current_pos <= end:
+            # Check if temp file still exists
+            if not os.path.exists(temp_file_path):
+                print(f"❌ Temp file disappeared: {temp_file_path}")
+                break
+            
+            # Read chunk directly without waiting
+            try:
+                with open(temp_file_path, 'rb') as f:
+                    f.seek(current_pos)
+                    bytes_to_read = min(chunk_size, end - current_pos + 1)
+                    
+                    if bytes_to_read <= 0:
+                        break
+                        
+                    chunk = f.read(bytes_to_read)
+                    
+                    if not chunk:
+                        # No data available, but don't wait - just end the stream
+                        break
+                    
+                    yield chunk
+                    current_pos += len(chunk)
+                    
+            except IOError as e:
+                print(f"⚠️ IO error reading temp file: {e}")
+                break
+                
+    except Exception as e:
+        print(f"❌ Error streaming range: {e}")
+
+async def stream_temp_file_complete_improved(temp_file_path: str, total_size: int):
+    """Improved complete file streaming"""
+    print(f"📱 Streaming complete file")
+    
+    chunk_size = 32 * 1024  # 32KB chunks
+    current_pos = 0
+    
+    try:
+        while current_pos < total_size:
+            # Check if temp file still exists
+            if not os.path.exists(temp_file_path):
+                print(f"❌ Temp file disappeared: {temp_file_path}")
+                break
+            
+            # Get current file size
+            current_file_size = os.path.getsize(temp_file_path)
+            
+            # Read available data without waiting too long
+            if current_pos < current_file_size:
+                try:
+                    with open(temp_file_path, 'rb') as f:
+                        f.seek(current_pos)
+                        bytes_to_read = min(chunk_size, current_file_size - current_pos)
+                        
+                        if bytes_to_read <= 0:
+                            await asyncio.sleep(0.1)
+                            continue
+                            
+                        chunk = f.read(bytes_to_read)
+                        
+                        if not chunk:
+                            await asyncio.sleep(0.1)
+                            continue
+                        
+                        yield chunk
+                        current_pos += len(chunk)
+                        
+                except IOError as e:
+                    print(f"⚠️ IO error reading temp file: {e}")
+                    await asyncio.sleep(0.1)
+                    continue
+            else:
+                # Wait a bit for more data, but don't wait forever
+                await asyncio.sleep(0.5)
+                
+    except Exception as e:
+        print(f"❌ Error streaming complete file: {e}")
+
+# Also update the HEAD handler for better VLC compatibility
+@app.head("/stream_mobile/{msg_id}")
+async def stream_mobile_head(msg_id: str):
+    """HEAD request for mobile streaming - returns headers without body"""
+    try:
+        # Get file info
+        file_info_response = await get_file_info(msg_id)
+        if file_info_response["status"] != "found":
+            raise HTTPException(404, "Episode not found")
+        
+        total_file_size = file_info_response["file_size"]
+        
+        return JSONResponse(
+            content={},
+            headers={
+                'Content-Type': 'video/mp4',
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(total_file_size),
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+                'Access-Control-Allow-Origin': '*',
+                'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+                'Access-Control-Allow-Headers': 'Range, Content-Range, Content-Length'
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.get("/mobile")
+async def serve_mobile_webapp():
+    """Serve the Netflix-like mobile webapp"""
+    return FileResponse("mobile/index.html", media_type="text/html")
+
+# Alternative endpoint for direct access to webapp files
+@app.get("/mobile/{file_path:path}")
+async def serve_mobile_files(file_path: str):
+    """Serve individual mobile webapp files"""
+    import os
+    from fastapi.responses import FileResponse, HTMLResponse
+    
+    # Security check - prevent directory traversal
+    if ".." in file_path or file_path.startswith("/"):
+        raise HTTPException(404, "File not found")
+    
+    file_full_path = os.path.join("mobile", file_path)
+    
+    # Check if file exists
+    if not os.path.exists(file_full_path):
+        raise HTTPException(404, "File not found")
+    
+    # Determine content type
+    if file_path.endswith('.html'):
+        return FileResponse(file_full_path, media_type="text/html")
+    elif file_path.endswith('.css'):
+        return FileResponse(file_full_path, media_type="text/css")
+    elif file_path.endswith('.js'):
+        return FileResponse(file_full_path, media_type="application/javascript")
+    else:
+        return FileResponse(file_full_path)
 
 if __name__ == "__main__":
     import uvicorn

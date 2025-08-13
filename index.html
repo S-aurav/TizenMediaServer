@@ -3112,37 +3112,8 @@ window.addEventListener("keyup", function(e) {
   }
 });
 
-function refreshVideoData() {
-  debug("🔄 Refreshing video data from server...");
-  
-  return fetch(SERVER + "/refresh/video_data")
-    .then(function(response) { return response.json(); })
-    .then(function(result) {
-      if (result.status === "success") {
-        debug("✅ Video data refreshed: " + result.series_count + " series");
-        // Reload current view
-        if (state.view === "landing") {
-          fetchSeries();
-        } else if (state.view === "seasons") {
-          fetchSeasons();
-        } else if (state.view === "episodes") {
-          fetchEpisodes();
-        }
-        return true;
-      } else {
-        debug("❌ Failed to refresh video data: " + result.message);
-        return false;
-      }
-    })
-    .catch(function(error) {
-      debug("❌ Error refreshing video data: " + error.message);
-      return false;
-    });
-}
-
 // Initialize the app
 fetchSeries();
-refreshVideoData();
 
 </script>
 </body>

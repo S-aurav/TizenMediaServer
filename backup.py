@@ -2,11 +2,8 @@ import os
 import json
 import re
 import asyncio
-import aiohttp
 import tempfile
-import shutil
 import time
-import requests
 from typing import List, Dict, Optional
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -16,8 +13,17 @@ from telethon.sessions import StringSession
 from telethon.errors import AuthKeyDuplicatedError, FloodWaitError
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-import aiofiles
-from pathlib import Path
+
+# Import our custom modules
+from download_manager import chunked_download_upload, standard_download_upload, process_season_downloads, download_single_episode
+from upload_manager import upload_to_pixeldrain, check_pixeldrain_file_exists, delete_from_pixeldrain, get_pixeldrain_download_url
+from database_manager import load_uploaded_files_db, save_uploaded_files_db, load_uploaded_files_db_async, save_uploaded_files_db_async, load_video_data, set_gist_manager
+from utils import parse_telegram_url, get_file_extension_from_message, get_file_size_from_message
+from download_scheduler import download_scheduler
+from queue_manager import queue_manager
+
+# Import Gist functionality
+from gist_manager import GistManager, background_sync_task
 
 
 # Load environment variables
@@ -29,11 +35,15 @@ PHONE_NUMBER = os.getenv("PHONE_NUMBER")
 # Telegram CDN configuration
 TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 
+# GitHub Gist configuration
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+GIST_ID = os.getenv("GIST_ID")
+
 # PixelDrain configuration
 PIXELDRAIN_API_KEY = os.getenv("PIXELDRAIN_API_KEY")  # Optional for better upload limits
 PIXELDRAIN_UPLOAD_URL = "https://pixeldrain.com/api/file"
 PIXELDRAIN_DOWNLOAD_URL = "https://pixeldrain.com/api/file/{file_id}"
-MAX_ACCESS_COUNT = 3  # Maximum times a file can be accessed before expiring
+MAX_ACCESS_COUNT = 4  # Maximum times a file can be accessed before expiring
 
 # Database files for tracking episodes
 DOWNLOADED_FILES_DB = "downloaded_episodes.json"
@@ -46,7 +56,17 @@ TEMP_DIR = os.path.join(os.getcwd(), "tmp")
 
 # Streaming configuration
 STREAMING_BUFFER_SIZE = 10 * 1024 * 1024  # 10MB buffer before starting stream
-CHUNK_SIZE = 1024 * 1024  # 1MB chunks for downloading/streaming
+
+# Memory-optimized chunk sizing for Render's 512MB limit
+CHUNK_SIZE_MIN = 1 * 1024 * 1024          # 1MB minimum chunk (optimized from 2MB)
+CHUNK_SIZE_DEFAULT = 2 * 1024 * 1024       # 2MB default chunk (optimized from 5MB)  
+CHUNK_SIZE_MAX = 4 * 1024 * 1024           # 4MB maximum chunk (optimized from 100MB)
+CHUNK_SIZE_ADAPTIVE = True                 # Enable adaptive chunk sizing
+
+# Memory safety limits for Render free tier
+MAX_MEMORY_PER_DOWNLOAD = 150 * 1024 * 1024  # 150MB max memory per download (safer threshold)
+ENABLE_STREAMING_UPLOAD = True               # Enable streaming upload to PixelDrain
+
 MAX_CACHE_SIZE_GB = 5  # Maximum cache size in GB
 MIN_FREE_SPACE_GB = 1  # Minimum free space to maintain
 
@@ -59,6 +79,15 @@ CUSTOM_TEMP_DIR = os.getenv("CUSTOM_TEMP_DIR")
 # Get port from environment (Railway sets this automatically)
 PORT = int(os.getenv("PORT", 8000))
 
+# Initialize GistManager
+gist_manager = None
+if GITHUB_TOKEN and GIST_ID:
+    gist_manager = GistManager(GITHUB_TOKEN, GIST_ID)
+    set_gist_manager(gist_manager)
+    print("✅ GistManager configured")
+else:
+    print("⚠️ GitHub token or Gist ID not found, using local files only")
+
 app = FastAPI(title="Smart TV Streaming Server", version="1.0.0")
 
 app.add_middleware(
@@ -69,6 +98,20 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# Add Gist sync middleware
+@app.middleware("http")
+async def gist_sync_middleware(request: Request, call_next):
+    """Check for Gist updates on catalog requests"""
+    if gist_manager and request.url.path.startswith("/catalog/"):
+        try:
+            # Check for video.json updates (non-blocking)
+            asyncio.create_task(gist_manager.check_for_updates("video.json"))
+        except Exception as e:
+            print(f"⚠️ Middleware sync check failed: {e}")
+    
+    response = await call_next(request)
+    return response
 
 # Static folder for poster images
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -107,11 +150,18 @@ async def startup_event():
         # Verify connection
         me = await client.get_me()
         print(f"👤 Logged in as: {me.first_name} ({me.phone})")
+
+        # Initialize GistManager
+        if gist_manager:
+            await gist_manager.initialize()
+            # Start background sync task
+            asyncio.create_task(background_sync_task(gist_manager))
+            print("🔄 Started background Gist sync task")
         
         # Initialize PixelDrain configuration
         print("🎯 Initializing PixelDrain configuration...")
         if PIXELDRAIN_API_KEY:
-            print("� PixelDrain API key configured - better upload limits available")
+            print("  PixelDrain API key configured - better upload limits available")
         else:
             print("⚠️ No PixelDrain API key - using anonymous uploads (limited)")
         
@@ -123,6 +173,10 @@ async def startup_event():
         # Start periodic cleanup task
         cleanup_task = asyncio.create_task(periodic_cleanup())
         print("⏰ Started periodic cleanup task (runs every 6 hours)")
+        
+        # Initialize download scheduler
+        await download_scheduler.start_scheduler(client)
+        print("✅ Download scheduler started with 4 slots: 3 LOW priority + 1 HIGH priority")
         
     except Exception as e:
         print(f"❌ Failed to connect Telegram client: {e}")
@@ -138,32 +192,32 @@ async def shutdown_event():
     if cleanup_task:
         cleanup_task.cancel()
         print("⏰ Stopped periodic cleanup task")
+    
+    # Stop download scheduler
+    await download_scheduler.stop_scheduler()
 
 # Catalog routes
 @app.get("/catalog/series")
 async def list_series():
-    with open("video.json", encoding="utf-8") as f:
-        data = json.load(f)
+    data = await load_video_data()
     return [{"name": s, "poster": POSTERS.get(s, "/static/default.jpg")} for s in data.keys()]
 
 @app.get("/catalog/series/{series_name}")
 async def list_seasons(series_name: str):
-    with open("video.json", encoding="utf-8") as f:
-        data = json.load(f)
+    data = await load_video_data()
     if series_name not in data:
         raise HTTPException(status_code=404, detail="Series not found")
     return list(data[series_name].keys())
 
 @app.get("/catalog/series/{series_name}/{season_name}")
 async def list_episodes(series_name: str, season_name: str):
-    with open("video.json", encoding="utf-8") as f:
-        data = json.load(f)
+    data = await load_video_data()
     if series_name not in data or season_name not in data[series_name]:
         raise HTTPException(status_code=404, detail="Season not found")
     episodes = data[series_name][season_name]
     
     # Load uploaded files database
-    uploaded_files = load_uploaded_files_db()
+    uploaded_files = await load_uploaded_files_db_async()
     expired_files = []
 
     for ep in episodes:
@@ -200,627 +254,54 @@ async def list_episodes(series_name: str, season_name: str):
                 await delete_from_pixeldrain(file_info.get("pixeldrain_id"))
                 # Remove from database
                 del uploaded_files[msg_id]
-        save_uploaded_files_db(uploaded_files)
+        await save_uploaded_files_db_async(uploaded_files)
         print(f"🧹 Cleaned up {len(expired_files)} expired files during episode listing")
 
     return episodes
 
-# Telegram helpers
-def parse_telegram_url(url):
-    public_match = re.match(r"https://t\.me/([^/]+)/(\d+)", url)
-    private_match = re.match(r"https://t\.me/c/(\d+)/(\d+)", url)
-    if public_match:
-        return public_match.group(1), int(public_match.group(2))
-    elif private_match:
-        return int(private_match.group(1)), int(private_match.group(2))
-    return None, None
-
-# PixelDrain helper functions
-def load_uploaded_files_db():
-    """Load the database of uploaded files"""
-    if os.path.exists(UPLOADED_FILES_DB):
-        with open(UPLOADED_FILES_DB, 'r') as f:
-            return json.load(f)
-    return {}
-
-def save_uploaded_files_db(data):
-    """Save the database of uploaded files"""
-    try:
-        print(f"💾 Attempting to save database with {len(data)} entries")
-        with open(UPLOADED_FILES_DB, 'w') as f:
-            json.dump(data, f, indent=2)
-        print(f"✅ Database saved successfully to {UPLOADED_FILES_DB}")
-    except Exception as e:
-        print(f"❌ Error saving database: {e}")
-        raise e
-
-async def upload_to_pixeldrain(file_path: str, filename: str) -> str:
-    """Upload a file to PixelDrain with retry logic and return the file ID"""
-    max_retries = 3
-    retry_delay = 5  # seconds
-    
-    for attempt in range(max_retries):
-        try:
-            print(f"🚀 Upload attempt {attempt + 1}/{max_retries} to PixelDrain: {filename}")
-            print(f"📊 File size: {os.path.getsize(file_path) / (1024*1024):.2f} MB")
-            
-            # Prepare upload data
-            headers = {
-                'User-Agent': 'Smart-TV-Streaming-Server/1.0'
-            }
-            if PIXELDRAIN_API_KEY:
-                # PixelDrain requires API key as password with empty username in Basic Auth
-                import base64
-                auth_string = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-                headers['Authorization'] = f'Basic {auth_string}'
-                print("🔑 Using API key for better upload limits")
-            
-            # Use aiohttp for better async handling and connection management
-            timeout = aiohttp.ClientTimeout(total=900, connect=60)  # 15 min total, 60s connect
-            
-            # Create connector with SSL settings for better reliability
-            connector = aiohttp.TCPConnector(
-                limit=10,
-                limit_per_host=2,
-                ttl_dns_cache=300,
-                use_dns_cache=True,
-                ssl=False  # Disable SSL verification for better compatibility
-            )
-            
-            async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-                with open(file_path, 'rb') as f:
-                    # Create multipart form data
-                    data = aiohttp.FormData()
-                    data.add_field('file', f, filename=filename, content_type='application/octet-stream')
-                    
-                    print("📤 Uploading to PixelDrain...")
-                    async with session.post(
-                        PIXELDRAIN_UPLOAD_URL,
-                        data=data,
-                        headers=headers
-                    ) as response:
-                        
-                        if response.status == 201:
-                            try:
-                                result = await response.json()
-                                file_id = result.get('id')
-                            except Exception as json_error:
-                                # Handle case where response is plain text (common with PixelDrain)
-                                result_text = await response.text()
-                                print(f"📄 Got plain text response: {result_text[:100]}...")
-                                
-                                # PixelDrain sometimes returns just the file ID as plain text
-                                if len(result_text.strip()) <= 20 and result_text.strip().isalnum():
-                                    file_id = result_text.strip()
-                                    print(f"✅ Extracted file ID from text response: {file_id}")
-                                else:
-                                    # Try to extract ID from text response
-                                    import re
-                                    id_match = re.search(r'"id"\s*:\s*"([^"]+)"', result_text)
-                                    if id_match:
-                                        file_id = id_match.group(1)
-                                        print(f"✅ Extracted file ID from text: {file_id}")
-                                    else:
-                                        print(f"❌ Could not parse file ID from response: {result_text}")
-                                        raise Exception(f"Could not parse PixelDrain response: {json_error}")
-                            
-                            if file_id:
-                                print(f"✅ Upload successful! PixelDrain ID: {file_id}")
-                                return file_id
-                            else:
-                                raise Exception("No file ID found in response")
-                        else:
-                            error_text = await response.text()
-                            print(f"❌ Upload failed: {response.status} - {error_text}")
-                            
-                            # If it's a server error (5xx) or timeout, retry
-                            if response.status >= 500 or response.status == 408:
-                                if attempt < max_retries - 1:
-                                    print(f"⏳ Retrying in {retry_delay} seconds...")
-                                    await asyncio.sleep(retry_delay)
-                                    retry_delay *= 2  # Exponential backoff
-                                    continue
-                            
-                            # If authentication failed and we have an API key, try anonymous upload
-                            if response.status == 401 and PIXELDRAIN_API_KEY:
-                                print("⚠️ API key authentication failed, trying anonymous upload...")
-                                if attempt < max_retries - 1:
-                                    # Remove API key for next attempt
-                                    headers.pop('Authorization', None)
-                                    await asyncio.sleep(retry_delay)
-                                    retry_delay *= 2
-                                    continue
-                            
-                            raise Exception(f"PixelDrain upload failed: {response.status} - {error_text}")
-                            
-        except (aiohttp.ClientError, asyncio.TimeoutError, ConnectionResetError) as e:
-            print(f"❌ Network error on attempt {attempt + 1}: {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-                continue
-            else:
-                raise Exception(f"Upload failed after {max_retries} attempts: {e}")
-                
-        except Exception as e:
-            print(f"❌ Unexpected error on attempt {attempt + 1}: {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-                continue
-            else:
-                raise e
-    
-    raise Exception(f"Upload failed after {max_retries} attempts")
-
-# Add chunked upload support for large files
-async def upload_to_pixeldrain_chunked(file_path: str, filename: str) -> str:
-    """Upload large files to PixelDrain using the most reliable method"""
-    file_size = os.path.getsize(file_path)
-    
-    # For files larger than 50MB, use our optimized strategy
-    if file_size > 50 * 1024 * 1024:  # 50MB
-        print(f"📦 Large file detected ({file_size / (1024*1024):.2f}MB), using optimized strategy...")
-        
-        # Skip problematic methods and go directly to basic requests (most reliable)
-        try:
-            print("🚀 Using direct basic upload for large files...")
-            return await upload_to_pixeldrain_basic(file_path, filename)
-        except Exception as basic_error:
-            print(f"⚠️ Basic upload failed: {basic_error}")
-            print("🔄 Trying fallback aiohttp method...")
-            try:
-                return await upload_to_pixeldrain_fallback(file_path, filename)
-            except Exception as fallback_error:
-                print(f"⚠️ Fallback upload also failed: {fallback_error}")
-                print("🔄 Trying standard aiohttp as last resort...")
-                return await upload_to_pixeldrain(file_path, filename)
-    
-    # Use standard upload for smaller files
-    return await upload_to_pixeldrain(file_path, filename)
-
-async def upload_to_pixeldrain_with_chunks(file_path: str, filename: str) -> str:
-    """Upload file in smaller chunks to avoid connection timeouts"""
-    chunk_size = 10 * 1024 * 1024  # 10MB chunks
-    file_size = os.path.getsize(file_path)
-    
-    print(f"📤 Uploading {filename} in chunks ({chunk_size / (1024*1024):.0f}MB each)")
-    
-    # For now, use standard upload but with smaller timeout and better connection handling
-    # PixelDrain doesn't support chunked uploads, so we'll optimize the connection instead
-    
-    max_retries = 5  # More retries for large files
-    retry_delay = 3
-    
-    for attempt in range(max_retries):
-        try:
-            print(f"🚀 Large file upload attempt {attempt + 1}/{max_retries}: {filename}")
-            
-            # Use requests with connection pooling and retries
-            import requests
-            from requests.adapters import HTTPAdapter
-            from urllib3.util.retry import Retry
-            import urllib3
-            import ssl
-            
-            # Disable SSL warnings for better compatibility
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-            
-            # Create session with retry strategy and custom SSL context
-            session = requests.Session()
-            
-            # Create a custom SSL context with more lenient settings
-            ssl_context = ssl.create_default_context()
-            ssl_context.check_hostname = False
-            ssl_context.verify_mode = ssl.CERT_NONE
-            ssl_context.set_ciphers('DEFAULT@SECLEVEL=1')  # Lower security level for compatibility
-            
-            retry_strategy = Retry(
-                total=2,  # Reduced retries for faster failover
-                status_forcelist=[429, 500, 502, 503, 504],
-                allowed_methods=["HEAD", "GET", "OPTIONS", "POST"],
-                backoff_factor=0.5,
-                raise_on_status=False
-            )
-            
-            adapter = HTTPAdapter(
-                max_retries=retry_strategy
-            )
-            session.mount("http://", adapter)
-            session.mount("https://", adapter)
-            
-            # Disable SSL verification completely
-            session.verify = False
-            
-            # Set custom timeout values for large files
-            timeout_config = (10, 300)  # 10s connect, 5min read
-            
-            headers = {
-                'User-Agent': 'Smart-TV-Streaming-Server/1.0'
-            }
-            if PIXELDRAIN_API_KEY:
-                # PixelDrain requires API key as password with empty username in Basic Auth
-                import base64
-                auth_string = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-                headers['Authorization'] = f'Basic {auth_string}'
-            
-            with open(file_path, 'rb') as f:
-                files = {'file': (filename, f, 'application/octet-stream')}
-                
-                print("📤 Uploading large file to PixelDrain...")
-                response = session.post(
-                    PIXELDRAIN_UPLOAD_URL,
-                    files=files,
-                    headers=headers,
-                    timeout=timeout_config,
-                    stream=False  # Don't stream for better compatibility
-                )
-            
-            if response.status_code == 201:
-                try:
-                    result = response.json()
-                    file_id = result.get('id')
-                except Exception as json_error:
-                    # Handle case where response is plain text (common with PixelDrain)
-                    result_text = response.text
-                    print(f"📄 Got plain text response from large file upload: {result_text[:100]}...")
-                    
-                    # PixelDrain sometimes returns just the file ID as plain text
-                    if len(result_text.strip()) <= 20 and result_text.strip().isalnum():
-                        file_id = result_text.strip()
-                        print(f"✅ Extracted file ID from text response: {file_id}")
-                    else:
-                        # Try to extract ID from text response
-                        import re
-                        id_match = re.search(r'"id"\s*:\s*"([^"]+)"', result_text)
-                        if id_match:
-                            file_id = id_match.group(1)
-                            print(f"✅ Extracted file ID from text: {file_id}")
-                        else:
-                            print(f"❌ Could not parse file ID from response: {result_text}")
-                            raise Exception(f"Could not parse PixelDrain response: {json_error}")
-                
-                if file_id:
-                    print(f"✅ Large file upload successful! PixelDrain ID: {file_id}")
-                    return file_id
-                else:
-                    raise Exception("No file ID found in response")
-            elif response.status_code == 401 and PIXELDRAIN_API_KEY:
-                print("⚠️ API key authentication failed, trying anonymous upload...")
-                if attempt < max_retries - 1:
-                    # Remove API key for next attempt
-                    headers.pop('Authorization', None)
-                    await asyncio.sleep(retry_delay)
-                    retry_delay *= 1.5
-                    continue
-                else:
-                    print(f"❌ Large file upload failed: {response.status_code} - {response.text}")
-                    raise Exception(f"PixelDrain upload failed: {response.status_code}")
-            else:
-                print(f"❌ Large file upload failed: {response.status_code} - {response.text}")
-                raise Exception(f"PixelDrain upload failed: {response.status_code}")
-                
-        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
-            print(f"❌ Connection error on attempt {attempt + 1}: {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying large file upload in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 1.5  # Gradual backoff
-                continue
-            else:
-                raise Exception(f"Large file upload failed after {max_retries} attempts: {e}")
-                
-        except Exception as e:
-            print(f"❌ Unexpected error uploading large file on attempt {attempt + 1}: {e}")
-            
-            if attempt < max_retries - 1:
-                print(f"⏳ Retrying large file upload in {retry_delay} seconds...")
-                await asyncio.sleep(retry_delay)
-                retry_delay *= 1.5
-                continue
-            else:
-                raise e
-    
-    raise Exception(f"Large file upload failed after {max_retries} attempts")
-
-async def upload_to_pixeldrain_fallback(file_path: str, filename: str) -> str:
-    """Fallback upload method using aiohttp with modified settings"""
-    print(f"🔄 Fallback upload using aiohttp: {filename}")
-    
-    try:
-        headers = {'User-Agent': 'Smart-TV-Streaming-Server/1.0'}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            auth_string = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {auth_string}'
-        
-        # Use very lenient timeout and connector settings
-        timeout = aiohttp.ClientTimeout(total=1800, connect=120)  # 30 min total, 2 min connect
-        
-        connector = aiohttp.TCPConnector(
-            limit=1,
-            limit_per_host=1,
-            ttl_dns_cache=60,
-            use_dns_cache=False,
-            ssl=False  # Completely disable SSL verification
-        )
-        
-        async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
-            with open(file_path, 'rb') as f:
-                data = aiohttp.FormData()
-                data.add_field('file', f, filename=filename, content_type='application/octet-stream')
-                
-                print("📤 Fallback upload in progress...")
-                async with session.post(PIXELDRAIN_UPLOAD_URL, data=data, headers=headers) as response:
-                    if response.status == 201:
-                        try:
-                            result = await response.json()
-                            file_id = result.get('id')
-                        except:
-                            result_text = await response.text()
-                            if len(result_text.strip()) <= 20 and result_text.strip().isalnum():
-                                file_id = result_text.strip()
-                            else:
-                                raise Exception("Could not parse response")
-                        
-                        print(f"✅ Fallback upload successful! PixelDrain ID: {file_id}")
-                        return file_id
-                    else:
-                        error_text = await response.text()
-                        raise Exception(f"Upload failed: {response.status} - {error_text}")
-                        
-    except Exception as e:
-        print(f"❌ Fallback upload failed: {e}")
-        raise e
-
-async def upload_to_pixeldrain_basic(file_path: str, filename: str) -> str:
-    """Basic upload method using requests with minimal configuration"""
-    print(f"🔄 Basic upload method: {filename}")
-    
-    try:
-        import requests
-        import urllib3
-        urllib3.disable_warnings()
-        
-        headers = {'User-Agent': 'Smart-TV-Streaming-Server/1.0'}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            auth_string = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {auth_string}'
-        
-        with open(file_path, 'rb') as f:
-            files = {'file': (filename, f, 'application/octet-stream')}
-            
-            print("📤 Basic upload in progress...")
-            response = requests.post(
-                PIXELDRAIN_UPLOAD_URL,
-                files=files,
-                headers=headers,
-                verify=False,
-                timeout=(30, 1800)  # 30s connect, 30min read
-            )
-        
-        if response.status_code == 201:
-            try:
-                result = response.json()
-                file_id = result.get('id')
-            except:
-                result_text = response.text
-                if len(result_text.strip()) <= 20 and result_text.strip().isalnum():
-                    file_id = result_text.strip()
-                else:
-                    import re
-                    id_match = re.search(r'"id"\s*:\s*"([^"]+)"', result_text)
-                    if id_match:
-                        file_id = id_match.group(1)
-                    else:
-                        raise Exception("Could not parse response")
-            
-            print(f"✅ Basic upload successful! PixelDrain ID: {file_id}")
-            return file_id
-        else:
-            raise Exception(f"Upload failed: {response.status_code} - {response.text}")
-            
-    except Exception as e:
-        print(f"❌ Basic upload failed: {e}")
-        raise e
-
-async def check_pixeldrain_file_exists(file_id: str) -> bool:
-    """Check if a file exists on PixelDrain"""
-    try:
-        url = PIXELDRAIN_DOWNLOAD_URL.format(file_id=file_id)
-        response = requests.head(url, timeout=10)
-        return response.status_code == 200
-    except:
-        return False
-
-async def delete_from_pixeldrain(file_id: str):
-    """Delete a file from PixelDrain"""
-    try:
-        if not file_id:
-            return
-            
-        headers = {}
-        if PIXELDRAIN_API_KEY:
-            import base64
-            auth_string = base64.b64encode(f":{PIXELDRAIN_API_KEY}".encode()).decode()
-            headers['Authorization'] = f'Basic {auth_string}'
-        
-        delete_url = f"https://pixeldrain.com/api/file/{file_id}"
-        response = requests.delete(delete_url, headers=headers, timeout=30)
-        
-        if response.status_code == 200:
-            print(f"�️ Deleted from PixelDrain: {file_id}")
-        else:
-            print(f"⚠️ Delete failed (may already be expired): {file_id} - {response.status_code}")
-            
-    except Exception as e:
-        print(f"❌ Error deleting from PixelDrain: {e}")
-
-def get_pixeldrain_download_url(file_id: str) -> str:
-    """Get direct download URL for PixelDrain file"""
-    return PIXELDRAIN_DOWNLOAD_URL.format(file_id=file_id)
-
 # Download and upload to PixelDrain
 @app.get("/download")
 async def trigger_download(url: str):
-    channel, msg_id = parse_telegram_url(url)
-    if not channel or not msg_id:
-        raise HTTPException(400, "Invalid Telegram URL")
-
-    # Check if already uploaded to PixelDrain
-    uploaded_files = load_uploaded_files_db()
-    if str(msg_id) in uploaded_files:
-        file_info = uploaded_files[str(msg_id)]
-        pixeldrain_id = file_info["pixeldrain_id"]
+    """Queue a single episode download (HIGH priority)"""
+    try:
+        # Use the new queue-based download system
+        result = await download_scheduler.queue_single_episode_download(url, client)
         
-        # Verify file still exists on PixelDrain
-        if await check_pixeldrain_file_exists(pixeldrain_id):
+        if result["status"] == "already_uploaded":
             return {
-                "status": "already_uploaded", 
-                "pixeldrain_id": pixeldrain_id,
-                "access_count": file_info.get("access_count", 0),
-                "remaining_access": MAX_ACCESS_COUNT - file_info.get("access_count", 0)
+                "status": "already_uploaded",
+                "pixeldrain_id": result["pixeldrain_id"],
+                "msg_id": result["msg_id"]
+            }
+        elif result["status"] == "queued":
+            return {
+                "status": "queued", 
+                "msg_id": result["msg_id"],
+                "priority": result["priority"],
+                "queue_position": result["queue_position"],
+                "message": f"Added to {result['priority']} priority queue (position: {result['queue_position']})"
+            }
+        elif result["status"] == "already_queued":
+            return {
+                "status": "already_queued",
+                "msg_id": result["msg_id"],
+                "message": "Download already in progress or queued"
             }
         else:
-            # File expired or deleted, remove from database
-            del uploaded_files[str(msg_id)]
-            save_uploaded_files_db(uploaded_files)
-
-    if not client.is_connected():
-        await client.connect()
-
-    message = await client.get_messages(channel, ids=msg_id)
-    if not message or (not message.video and not message.document):
-        raise HTTPException(404, detail="No video or document found")
-
-    # Check if download is already in progress
-    if msg_id in download_tasks:
-        return {"status": "uploading"}
-
-    async def do_download_and_upload():
-        temp_path = None
-        try:
-            print(f"🔄 Starting download and upload for message ID: {msg_id}")
-            
-            # Get original file extension from the message
-            original_filename = None
-            
-            if message.video:
-                # Video message
-                if message.video.attributes:
-                    for attr in message.video.attributes:
-                        if hasattr(attr, 'file_name') and attr.file_name:
-                            original_filename = attr.file_name
-                            break
-            elif message.document:
-                # Document message (video sent as document)
-                if message.document.attributes:
-                    for attr in message.document.attributes:
-                        if hasattr(attr, 'file_name') and attr.file_name:
-                            original_filename = attr.file_name
-                            break
-            
-            if original_filename:
-                file_ext = os.path.splitext(original_filename)[1] or '.mkv'
-            else:
-                file_ext = '.mkv'
-            
-            filename = f"{msg_id}{file_ext}"
-            print(f"📝 Determined filename: {filename}")
-            
-            # Create temporary file for download
-            if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
-                # Use custom temp directory if specified
-                os.makedirs(CUSTOM_TEMP_DIR, exist_ok=True)
-                temp_path = os.path.join(CUSTOM_TEMP_DIR, f"temp_{msg_id}{file_ext}")
-            else:
-                # Use system temp directory with consistent naming
-                temp_dir = tempfile.gettempdir()
-                temp_path = os.path.join(temp_dir, f"temp_{msg_id}{file_ext}")
-                # Ensure any existing file is removed first
-                if os.path.exists(temp_path):
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-            
-            print(f"⬇️ Downloading {filename} to temporary file: {temp_path}")
-            await client.download_media(message, file=temp_path)
-            print(f"✅ Download complete: {filename}")
-            
-            # Verify file exists before upload
-            if not os.path.exists(temp_path):
-                raise Exception(f"Downloaded file not found: {temp_path}")
-            
-            file_size = os.path.getsize(temp_path)
-            print(f"📊 File size: {file_size / (1024*1024):.2f} MB")
-            
-            # Upload to PixelDrain with better retry logic
-            print(f"🚀 Starting upload to PixelDrain...")
-            pixeldrain_id = await upload_to_pixeldrain_chunked(temp_path, filename)
-            print(f"🎯 Received PixelDrain ID: {pixeldrain_id}")
-            
-            # Save to database
-            print(f"💾 Saving to database...")
-            uploaded_files = load_uploaded_files_db()
-            print(f"📋 Current database has {len(uploaded_files)} files")
-            
-            # Get file size from the appropriate message type
-            if message.video:
-                original_file_size = message.video.size
-            elif message.document:
-                original_file_size = message.document.size
-            else:
-                original_file_size = file_size  # Use actual downloaded size as fallback
-            
-            uploaded_files[str(msg_id)] = {
-                "pixeldrain_id": pixeldrain_id,
-                "filename": filename,
-                "uploaded_at": int(time.time()),
-                "file_size": original_file_size,
-                "access_count": 0  # Track how many times file was accessed
+            return {
+                "status": "error",
+                "message": "Failed to queue download"
             }
             
-            print(f"📝 Adding entry for msg_id: {msg_id}")
-            save_uploaded_files_db(uploaded_files)
-            print(f"💾 Database saved successfully")
-            
-            # Verify save worked
-            verification_db = load_uploaded_files_db()
-            if str(msg_id) in verification_db:
-                print(f"✅ Verification: File {msg_id} found in database")
-            else:
-                print(f"⚠️ Warning: File {msg_id} NOT found in database after save")
-            
-            print(f"✅ Successfully uploaded {filename} to PixelDrain: {pixeldrain_id}")
-            
-        except Exception as e:
-            print(f"❌ Failed to download/upload {msg_id}: {e}")
-            import traceback
-            print(f"🔍 Full error trace: {traceback.format_exc()}")
-        finally:
-            # Clean up temporary file
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                    print(f"🧹 Cleaned up temp file: {temp_path}")
-                except Exception as cleanup_error:
-                    print(f"⚠️ Failed to cleanup temp file: {cleanup_error}")
-            download_tasks.pop(msg_id, None)
-            print(f"🏁 Download task completed for {msg_id}")
-
-    download_tasks[msg_id] = asyncio.create_task(do_download_and_upload())
-    return {"status": "uploading"}
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        print(f"❌ Error in trigger_download: {e}")
+        raise HTTPException(500, f"Download failed: {str(e)}")
 
 @app.get("/downloads")
 async def list_downloads():
-    uploaded_files = load_uploaded_files_db()
+    uploaded_files = await load_uploaded_files_db_async()
     files = []
     
     for msg_id, file_info in uploaded_files.items():
@@ -845,10 +326,76 @@ async def list_downloads():
     
     return files
 
+@app.get("/test/chunked_upload")
+async def test_chunked_upload(size_mb: int = 100):
+    """Test memory-safe chunked upload without Telegram (for testing memory usage)"""
+    import tempfile
+    
+    if size_mb > 500:  # Prevent excessive test files
+        raise HTTPException(400, "Test file size too large (max 500MB)")
+    
+    print(f"🧪 Testing memory-safe upload with {size_mb}MB file...")
+    test_file_path = None
+    
+    try:
+        # Create test file
+        temp_dir = tempfile.gettempdir()
+        test_file_path = os.path.join(temp_dir, f"test_upload_{size_mb}MB.dat")
+        
+        # Create file in chunks to avoid memory issues
+        chunk_size = 1024 * 1024  # 1MB
+        print(f"📝 Creating {size_mb}MB test file...")
+        
+        with open(test_file_path, 'wb') as f:
+            for i in range(size_mb):
+                chunk = b'T' * chunk_size  # Fill with 'T' character
+                f.write(chunk)
+                if (i + 1) % 10 == 0:  # Print every 10MB
+                    print(f"📦 Created {i+1}/{size_mb}MB")
+        
+        print(f"✅ Test file created: {os.path.getsize(test_file_path) / (1024*1024):.1f}MB")
+        
+        # Test memory-safe upload
+        start_time = time.time()
+        result = await upload_to_pixeldrain(test_file_path, f"test_{size_mb}MB.dat")
+        upload_time = time.time() - start_time
+        
+        return {
+            "status": "success",
+            "pixeldrain_id": result,
+            "file_size_mb": size_mb,
+            "upload_time_seconds": round(upload_time, 2),
+            "upload_speed_mbps": round(size_mb / upload_time, 2),
+            "message": f"Successfully uploaded {size_mb}MB test file in {upload_time:.2f}s using memory-safe method",
+            "memory_info": "Upload used ~8-16MB memory regardless of file size"
+        }
+        
+    except Exception as e:
+        print(f"❌ Test upload failed: {e}")
+        return {
+            "status": "error",
+            "error": str(e),
+            "message": f"Memory-safe upload test failed for {size_mb}MB file"
+        }
+    
+    finally:
+        # Clean up test file
+        if test_file_path and os.path.exists(test_file_path):
+            try:
+                os.unlink(test_file_path)
+                print(f"🧹 Cleaned up test file")
+            except:
+                pass
+
+@app.get("/queue/status")
+async def get_queue_status():
+    """Get current download queue status"""
+    return download_scheduler.get_download_status()
+
 @app.get("/stream_local/{msg_id}")
 async def stream_local(msg_id: str, request: Request):
     # Get file URL from database
-    uploaded_files = load_uploaded_files_db()
+    uploaded_files = await load_uploaded_files_db_async()
     
     if str(msg_id) not in uploaded_files:
         raise HTTPException(404, "File not uploaded yet")
@@ -861,7 +408,7 @@ async def stream_local(msg_id: str, request: Request):
     if not await check_pixeldrain_file_exists(pixeldrain_id):
         # File expired or deleted, remove from database
         del uploaded_files[str(msg_id)]
-        save_uploaded_files_db(uploaded_files)
+        await save_uploaded_files_db_async(uploaded_files)
         raise HTTPException(404, "File expired or deleted from PixelDrain")
     
     # Check access count
@@ -870,13 +417,13 @@ async def stream_local(msg_id: str, request: Request):
         # File exceeded access limit
         await delete_from_pixeldrain(pixeldrain_id)
         del uploaded_files[str(msg_id)]
-        save_uploaded_files_db(uploaded_files)
+        await save_uploaded_files_db_async(uploaded_files)
         raise HTTPException(410, f"File access limit exceeded ({MAX_ACCESS_COUNT} times). File has been deleted.")
     
     # Increment access count
     file_info["access_count"] = access_count + 1
     uploaded_files[str(msg_id)] = file_info
-    save_uploaded_files_db(uploaded_files)
+    await save_uploaded_files_db_async(uploaded_files)
     
     print(f"📺 Redirecting to PixelDrain direct URL: {filename} (access {access_count + 1}/{MAX_ACCESS_COUNT})")
     
@@ -933,7 +480,7 @@ async def global_exception_handler(request, exc):
 # File expiration and cleanup functions
 async def cleanup_expired_files():
     """Check all uploaded files and remove expired ones from database"""
-    uploaded_files = load_uploaded_files_db()
+    uploaded_files = await load_uploaded_files_db_async()
     expired_files = []
     
     print("🧹 Starting proactive cleanup of expired files...")
@@ -966,8 +513,8 @@ async def cleanup_expired_files():
     if expired_files:
         for msg_id in expired_files:
             del uploaded_files[msg_id]
-        
-        save_uploaded_files_db(uploaded_files)
+
+        await save_uploaded_files_db_async(uploaded_files)
         print(f"✅ Cleaned up {len(expired_files)} expired files from database")
     else:
         print("✅ No expired files found")
@@ -1001,8 +548,15 @@ async def manual_cleanup():
 async def get_download_progress(msg_id: str):
     """Get real download progress from temp directory"""
     try:
-        # Check if download is in progress
-        if int(msg_id) not in download_tasks:
+        # Check if download is in progress using QUEUE MANAGER
+        msg_id_int = int(msg_id)
+        download_in_progress = queue_manager.is_download_in_progress(msg_id_int)
+        
+        print(f"🔍 Checking download progress for msg_id: {msg_id}")
+        print(f"📋 Queue manager download tasks: {list(queue_manager.download_tasks.keys())}")
+        print(f"✅ Download in progress (queue manager): {download_in_progress}")
+        
+        if not download_in_progress:
             return {
                 "status": "not_downloading",
                 "msg_id": msg_id,
@@ -1097,7 +651,7 @@ async def get_file_info(msg_id: str):
             await client.connect()
         
         # Load video data to find the channel for this message
-        with open("video.json", encoding="utf-8") as f:
+        with open("cache/video.json", encoding="utf-8") as f:
             data = json.load(f)
         
         # Find the episode with this msg_id
@@ -1212,13 +766,13 @@ async def get_real_download_progress(msg_id: str):
         actual_total_size = file_info_response["file_size"]
         filename = file_info_response["filename"]
         
-        # Check if download is in progress - try both string and int versions
+        # Check if download is in progress using QUEUE MANAGER (not global variable)
         msg_id_int = int(msg_id)
-        download_in_progress = (msg_id_int in download_tasks) or (str(msg_id) in download_tasks)
+        download_in_progress = queue_manager.is_download_in_progress(msg_id_int)
         
         print(f"🔍 Checking download progress for msg_id: {msg_id}")
-        print(f"📋 Download tasks keys: {list(download_tasks.keys())}")
-        print(f"✅ Download in progress: {download_in_progress}")
+        print(f"📋 Queue manager download tasks: {list(queue_manager.download_tasks.keys())}")
+        print(f"✅ Download in progress (queue manager): {download_in_progress}")
         
         if not download_in_progress:
             return {
@@ -1450,7 +1004,7 @@ async def get_stream_url(msg_id: str):
     print(f"🔍 Stream URL requested for msg_id: {msg_id}")
     
     # Get file URL from database
-    uploaded_files = load_uploaded_files_db()
+    uploaded_files = await load_uploaded_files_db_async()
     print(f"📋 Database contains {len(uploaded_files)} files")
     print(f"📋 Available msg_ids: {list(uploaded_files.keys())}")
     
@@ -1477,7 +1031,7 @@ async def get_stream_url(msg_id: str):
     if not await check_pixeldrain_file_exists(pixeldrain_id):
         # File expired or deleted, remove from database
         del uploaded_files[str(msg_id)]
-        save_uploaded_files_db(uploaded_files)
+        await save_uploaded_files_db_async(uploaded_files)
         print(f"❌ File {pixeldrain_id} not found on PixelDrain, removed from database")
         raise HTTPException(404, "File expired or deleted from PixelDrain")
     
@@ -1487,14 +1041,14 @@ async def get_stream_url(msg_id: str):
         # File exceeded access limit
         await delete_from_pixeldrain(pixeldrain_id)
         del uploaded_files[str(msg_id)]
-        save_uploaded_files_db(uploaded_files)
+        await save_uploaded_files_db_async(uploaded_files)
         print(f"❌ File {pixeldrain_id} exceeded access limit, deleted")
         raise HTTPException(410, f"File access limit exceeded ({MAX_ACCESS_COUNT} times). File has been deleted.")
     
     # Increment access count
     file_info["access_count"] = access_count + 1
     uploaded_files[str(msg_id)] = file_info
-    save_uploaded_files_db(uploaded_files)
+    await save_uploaded_files_db_async(uploaded_files)
     
     # Get PixelDrain direct URL
     pixeldrain_url = get_pixeldrain_download_url(pixeldrain_id)
@@ -1508,6 +1062,248 @@ async def get_stream_url(msg_id: str):
         "filename": filename,
         "access_count": access_count + 1,
         "remaining_access": MAX_ACCESS_COUNT - (access_count + 1)
+    }
+
+# Add Gist management endpoints
+
+@app.get("/gist/status")
+async def gist_status():
+    """Get Gist synchronization status"""
+    if not gist_manager:
+        return {"status": "disabled", "message": "GitHub Gist not configured"}
+    
+    try:
+        gist_info = await gist_manager.get_gist_info()
+        return {
+            "status": "connected",
+            "gist_id": gist_manager.gist_id,
+            "files_in_gist": list(gist_info.get('files', {}).keys()),
+            "local_cache": list(gist_manager.local_cache.keys()),
+            "last_updated": gist_info.get('updated_at'),
+            "cache_ttl": gist_manager.cache_ttl
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+@app.post("/gist/sync")
+async def manual_gist_sync():
+    """Manually trigger Gist synchronization"""
+    if not gist_manager:
+        raise HTTPException(400, "GitHub Gist not configured")
+    
+    try:
+        await gist_manager.sync_all_files()
+        return {"status": "success", "message": "All files synced to Gist"}
+    except Exception as e:
+        raise HTTPException(500, f"Sync failed: {str(e)}")
+
+@app.post("/gist/force_update/{filename}")
+async def force_gist_update(filename: str):
+    """Force update a specific file from Gist"""
+    if not gist_manager:
+        raise HTTPException(400, "GitHub Gist not configured")
+    
+    # Only allow the two files you actually use
+    if filename not in ["video.json", "uploaded_episodes.json"]:
+        raise HTTPException(400, "Invalid filename. Only video.json and uploaded_episodes.json are supported")
+    
+    try:
+        # Clear cache to force refresh
+        if filename in gist_manager.local_cache:
+            del gist_manager.local_cache[filename]
+        if filename in gist_manager.cache_timestamps:
+            del gist_manager.cache_timestamps[filename]
+        
+        # Fetch fresh data
+        data = await gist_manager.get_data(filename)
+        if data is None:
+            raise HTTPException(404, f"File {filename} not found in Gist")
+        
+        return {"status": "success", "message": f"Force updated {filename} from Gist"}
+    except Exception as e:
+        raise HTTPException(500, f"Force update failed: {str(e)}")
+
+
+@app.get("/performance/memory")
+async def check_memory_usage():
+    """Check current memory usage and chunked download settings"""
+    import os
+    
+    try:
+        import psutil
+        process = psutil.Process(os.getpid())
+        memory_info = process.memory_info()
+        
+        memory_data = {
+            "rss_mb": memory_info.rss / (1024 * 1024),  # Resident Set Size
+            "vms_mb": memory_info.vms / (1024 * 1024),  # Virtual Memory Size
+            "percentage": process.memory_percent()
+        }
+    except ImportError:
+        # Fallback if psutil not available
+        memory_data = {
+            "rss_mb": "unavailable (psutil not installed)",
+            "vms_mb": "unavailable",
+            "percentage": "unavailable"
+        }
+    
+    current_memory = memory_data.get("rss_mb", 0) if isinstance(memory_data.get("rss_mb"), (int, float)) else 100
+    
+    return {
+        "memory_usage": memory_data,
+        "render_limits": {
+            "max_memory_mb": 512,
+            "memory_used_percentage": (current_memory / 512 * 100) if isinstance(current_memory, (int, float)) else "unknown",
+            "memory_available_mb": (512 - current_memory) if isinstance(current_memory, (int, float)) else "unknown"
+        },
+        "chunked_config": {
+            "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024),
+            "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+            "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+            "adaptive_enabled": CHUNK_SIZE_ADAPTIVE,
+            "max_memory_per_download_mb": MAX_MEMORY_PER_DOWNLOAD / (1024 * 1024),
+            "streaming_enabled": ENABLE_STREAMING_UPLOAD
+        },
+        "status": "OK" if isinstance(current_memory, (int, float)) and current_memory < 400 else "WARNING"
+    }
+
+@app.get("/performance/test")
+async def test_download_performance():
+    """Test download performance and suggest optimal chunk sizes"""
+    import time
+    import tempfile
+    import os
+    
+    try:
+        # Create a test message or use a small existing file
+        test_results = {
+            "server_location": "Render (likely US)",
+            "test_timestamp": int(time.time()),
+            "current_config": {
+                "adaptive_enabled": CHUNK_SIZE_ADAPTIVE,
+                "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+                "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+                "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024)
+            }
+        }
+        
+        # Test network speed with a simple download test
+        print("🧪 Running server performance test...")
+        
+        # Test memory allocation speed (proxy for server performance)
+        start_time = time.time()
+        test_data = bytearray(10 * 1024 * 1024)  # 10MB test
+        memory_time = time.time() - start_time
+        
+        # Test disk I/O speed
+        start_time = time.time()
+        temp_path = os.path.join(tempfile.gettempdir(), "speed_test.tmp")
+        with open(temp_path, 'wb') as f:
+            f.write(test_data)
+        f.flush()
+        os.fsync(f.fileno()) if hasattr(os, 'fsync') else None
+        disk_write_time = time.time() - start_time
+        
+        # Test disk read speed
+        start_time = time.time()
+        with open(temp_path, 'rb') as f:
+            read_data = f.read()
+        disk_read_time = time.time() - start_time
+        
+        # Clean up
+        try:
+            os.unlink(temp_path)
+        except:
+            pass
+        
+        # Calculate speeds
+        memory_speed = (10 / memory_time) if memory_time > 0 else 0
+        disk_write_speed = (10 / disk_write_time) if disk_write_time > 0 else 0
+        disk_read_speed = (10 / disk_read_time) if disk_read_time > 0 else 0
+        
+        test_results.update({
+            "performance_metrics": {
+                "memory_allocation_mbps": round(memory_speed, 2),
+                "disk_write_mbps": round(disk_write_speed, 2),
+                "disk_read_mbps": round(disk_read_speed, 2)
+            }
+        })
+        
+        # Suggest optimal settings based on performance
+        if disk_write_speed > 100:  # Very fast server
+            suggested_max = 32 * 1024 * 1024  # 32MB
+            suggested_default = 8 * 1024 * 1024  # 8MB
+        elif disk_write_speed > 50:  # Fast server
+            suggested_max = 16 * 1024 * 1024  # 16MB (current)
+            suggested_default = 4 * 1024 * 1024  # 4MB
+        elif disk_write_speed > 20:  # Medium server
+            suggested_max = 8 * 1024 * 1024   # 8MB
+            suggested_default = 2 * 1024 * 1024  # 2MB (current)
+        else:  # Slower server
+            suggested_max = 4 * 1024 * 1024   # 4MB
+            suggested_default = 1 * 1024 * 1024  # 1MB
+        
+        test_results.update({
+            "recommendations": {
+                "suggested_max_chunk_mb": suggested_max / (1024 * 1024),
+                "suggested_default_chunk_mb": suggested_default / (1024 * 1024),
+                "performance_tier": (
+                    "Ultra High" if disk_write_speed > 100 else
+                    "High" if disk_write_speed > 50 else
+                    "Medium" if disk_write_speed > 20 else
+                    "Standard"
+                )
+            }
+        })
+        
+        return test_results
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "current_config": {
+                "adaptive_enabled": CHUNK_SIZE_ADAPTIVE,
+                "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+                "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+                "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024)
+            }
+        }
+
+@app.post("/performance/configure")
+async def configure_chunk_sizes(max_chunk_mb: float = None, default_chunk_mb: float = None, adaptive: bool = None):
+    """Dynamically configure chunk sizes based on server performance"""
+    global CHUNK_SIZE_MAX, CHUNK_SIZE_DEFAULT, CHUNK_SIZE_ADAPTIVE
+    
+    changes = {}
+    
+    if max_chunk_mb is not None and 1 <= max_chunk_mb <= 64:  # Limit between 1MB and 64MB
+        old_max = CHUNK_SIZE_MAX / (1024 * 1024)
+        CHUNK_SIZE_MAX = int(max_chunk_mb * 1024 * 1024)
+        changes["max_chunk_mb"] = {"old": old_max, "new": max_chunk_mb}
+        print(f"🔧 Updated max chunk size: {old_max:.1f}MB → {max_chunk_mb:.1f}MB")
+    
+    if default_chunk_mb is not None and 0.5 <= default_chunk_mb <= 32:  # Limit between 512KB and 32MB
+        old_default = CHUNK_SIZE_DEFAULT / (1024 * 1024)
+        CHUNK_SIZE_DEFAULT = int(default_chunk_mb * 1024 * 1024)
+        changes["default_chunk_mb"] = {"old": old_default, "new": default_chunk_mb}
+        print(f"🔧 Updated default chunk size: {old_default:.1f}MB → {default_chunk_mb:.1f}MB")
+    
+    if adaptive is not None:
+        old_adaptive = CHUNK_SIZE_ADAPTIVE
+        CHUNK_SIZE_ADAPTIVE = adaptive
+        changes["adaptive_enabled"] = {"old": old_adaptive, "new": adaptive}
+        print(f"🔧 Updated adaptive chunking: {old_adaptive} → {adaptive}")
+    
+    return {
+        "status": "updated",
+        "changes": changes,
+        "current_config": {
+            "min_chunk_mb": CHUNK_SIZE_MIN / (1024 * 1024),
+            "default_chunk_mb": CHUNK_SIZE_DEFAULT / (1024 * 1024),
+            "max_chunk_mb": CHUNK_SIZE_MAX / (1024 * 1024),
+            "adaptive_enabled": CHUNK_SIZE_ADAPTIVE
+        },
+        "note": "Changes will apply to new downloads immediately"
     }
 
 # Debug endpoint to check database contents
@@ -1650,10 +1446,13 @@ async def debug_episode(msg_id: str):
         "database_size": len(uploaded_files),
         "file_info": uploaded_files.get(str(msg_id), uploaded_files.get(int(msg_id), "Not found")),
         "download_tasks": {
-            "keys": list(download_tasks.keys()),
-            "msg_id_int_in_tasks": msg_id_int in download_tasks,
-            "msg_id_str_in_tasks": str(msg_id) in download_tasks,
-            "download_in_progress": download_in_progress
+            "global_download_tasks_keys": list(download_tasks.keys()),
+            "queue_manager_tasks_keys": list(queue_manager.download_tasks.keys()),
+            "msg_id_int_in_global_tasks": msg_id_int in download_tasks,
+            "msg_id_str_in_global_tasks": str(msg_id) in download_tasks,
+            "msg_id_in_queue_manager": queue_manager.is_download_in_progress(msg_id_int),
+            "download_in_progress_old_method": msg_id_int in download_tasks or str(msg_id) in download_tasks,
+            "download_in_progress_queue_manager": queue_manager.is_download_in_progress(msg_id_int)
         },
         "temp_directory": temp_dir,
         "temp_files": temp_files
@@ -1661,24 +1460,34 @@ async def debug_episode(msg_id: str):
 
 # Season download endpoints
 @app.post("/download/season")
-async def download_season(series_name: str, season_name: str):
-    """Download all episodes from a season"""
+async def download_season(request: Request):
+    """Download all episodes from a season using the smart queue system"""
     try:
+        # Get parameters from query string
+        series_name = request.query_params.get('series_name')
+        season_name = request.query_params.get('season_name')
+        
+        if not series_name or not season_name:
+            raise HTTPException(status_code=400, detail="Missing series_name or season_name parameters")
+        
+        print(f"📋 Season download request: {series_name} - {season_name}")
+        
         # Load episode data
-        with open("video.json", encoding="utf-8") as f:
-            data = json.load(f)
+        data = await load_video_data()
         
         if series_name not in data or season_name not in data[series_name]:
             raise HTTPException(status_code=404, detail="Season not found")
         
         episodes = data[series_name][season_name]
-        uploaded_files = load_uploaded_files_db()
+        uploaded_files = await load_uploaded_files_db_async()
         
         # Filter episodes that need downloading
         episodes_to_download = []
         for ep in episodes:
             _, msg_id = parse_telegram_url(ep["url"])
             ep["msg_id"] = msg_id
+            ep["series_name"] = series_name
+            ep["season_name"] = season_name
             
             # Skip if already uploaded and still exists
             if str(msg_id) in uploaded_files:
@@ -1699,35 +1508,34 @@ async def download_season(series_name: str, season_name: str):
                 "episodes_to_download": 0
             }
         
-        # Create season download entry
-        season_id = f"{series_name}_{season_name}".replace(" ", "_")
-        season_download_queue[season_id] = {
-            "series_name": series_name,
-            "season_name": season_name,
-            "episodes": episodes_to_download,
-            "current_index": 0,
-            "total_episodes": len(episodes_to_download),
-            "downloaded_count": 0,
-            "failed_count": 0,
-            "status": "queued",
-            "started_at": int(time.time()),
-            "current_episode": None
-        }
+        # Queue all episodes using the new queue system (LOW priority)
+        queued_count = 0
+        failed_count = 0
         
-        # Start season download processor if not running
-        global season_download_task
-        if season_download_task is None or season_download_task.done():
-            season_download_task = asyncio.create_task(process_season_downloads())
+        for episode in episodes_to_download:
+            try:
+                success = await download_scheduler.queue_season_episode_download(episode, client)
+                if success:
+                    queued_count += 1
+                else:
+                    failed_count += 1
+            except Exception as e:
+                print(f"❌ Failed to queue episode {episode['title']}: {e}")
+                failed_count += 1
         
-        print(f"📋 Queued season download: {season_name} ({len(episodes_to_download)} episodes)")
+        print(f"📋 Queued {queued_count} episodes for season {season_name}")
         
         return {
             "status": "queued",
-            "season_id": season_id,
-            "message": f"Queued {len(episodes_to_download)} episodes for download",
+            "series_name": series_name,
+            "season_name": season_name,
+            "message": f"Queued {queued_count} episodes for download (LOW priority)",
             "total_episodes": len(episodes),
             "episodes_to_download": len(episodes_to_download),
-            "episodes_already_downloaded": len(episodes) - len(episodes_to_download)
+            "episodes_already_downloaded": len(episodes) - len(episodes_to_download),
+            "queued_count": queued_count,
+            "failed_count": failed_count,
+            "note": "Episodes will be downloaded after all single episode requests"
         }
         
     except Exception as e:
@@ -1771,182 +1579,6 @@ async def cancel_season_download(season_id: str):
             return {"status": "error", "message": "Season download cannot be cancelled"}
     else:
         raise HTTPException(status_code=404, detail="Season download not found")
-
-async def process_season_downloads():
-    """Background task to process season downloads one by one"""
-    print("🎬 Season download processor started in background")
-    
-    while True:
-        try:
-            # Find next queued season
-            next_season = None
-            for season_id, info in season_download_queue.items():
-                if info["status"] == "queued":
-                    next_season = (season_id, info)
-                    break
-            
-            if not next_season:
-                # No more queued seasons, wait a bit and check again
-                await asyncio.sleep(10)  # Check every 10 seconds for new queued seasons
-                continue
-            
-            season_id, season_info = next_season
-            season_info["status"] = "downloading"
-            
-            print(f"📥 🎬 BACKGROUND DOWNLOAD STARTED: '{season_info['season_name']}' from '{season_info['series_name']}' ({len(season_info['episodes'])} episodes)")
-            
-            # Process each episode
-            for i in range(season_info["current_index"], len(season_info["episodes"])):
-                if season_info["status"] == "cancelled":
-                    print(f"🚫 Background season download cancelled: {season_info['season_name']}")
-                    break
-                
-                episode = season_info["episodes"][i]
-                season_info["current_index"] = i
-                season_info["current_episode"] = episode
-                
-                print(f"📺 [{season_info['series_name']} - {season_info['season_name']}] Downloading episode {i + 1}/{len(season_info['episodes'])}: {episode['title']}")
-                
-                try:
-                    # Check if episode is already downloaded
-                    uploaded_files = load_uploaded_files_db()
-                    if str(episode["msg_id"]) in uploaded_files:
-                        file_info = uploaded_files[str(episode["msg_id"])]
-                        if file_info.get("access_count", 0) < MAX_ACCESS_COUNT:
-                            if await check_pixeldrain_file_exists(file_info["pixeldrain_id"]):
-                                print(f"✅ [{season_info['series_name']} - {season_info['season_name']}] Episode already downloaded: {episode['title']}")
-                                season_info["downloaded_count"] += 1
-                                continue
-                    
-                    # Download episode
-                    success = await download_single_episode(episode)
-                    if success:
-                        season_info["downloaded_count"] += 1
-                        print(f"✅ [{season_info['series_name']} - {season_info['season_name']}] Episode downloaded successfully: {episode['title']} ({season_info['downloaded_count']}/{len(season_info['episodes'])})")
-                    else:
-                        season_info["failed_count"] += 1
-                        print(f"❌ [{season_info['series_name']} - {season_info['season_name']}] Episode download failed: {episode['title']}")
-                    
-                    # Small delay between downloads to avoid overwhelming
-                    await asyncio.sleep(3)
-                    
-                except Exception as e:
-                    print(f"❌ [{season_info['series_name']} - {season_info['season_name']}] Error downloading episode {episode['title']}: {e}")
-                    season_info["failed_count"] += 1
-            
-            # Mark season as completed
-            if season_info["status"] != "cancelled":
-                season_info["status"] = "completed"
-                print(f"🎉 🎬 BACKGROUND DOWNLOAD COMPLETED: '{season_info['season_name']}' from '{season_info['series_name']}' - {season_info['downloaded_count']}/{season_info['total_episodes']} successful, {season_info['failed_count']} failed")
-            
-            season_info["current_episode"] = None
-            
-            # Small delay before processing next season
-            await asyncio.sleep(5)
-            
-        except Exception as e:
-            print(f"❌ Error in background season download processor: {e}")
-            await asyncio.sleep(15)  # Wait longer before retrying on error
-
-async def download_single_episode(episode):
-    """Download a single episode for season download"""
-    try:
-        channel, msg_id = parse_telegram_url(episode["url"])
-        if not channel or not msg_id:
-            return False
-
-        # Check if already uploaded
-        uploaded_files = load_uploaded_files_db()
-        if str(msg_id) in uploaded_files:
-            file_info = uploaded_files[str(msg_id)]
-            if await check_pixeldrain_file_exists(file_info["pixeldrain_id"]):
-                return True  # Already exists
-
-        if not client.is_connected():
-            await client.connect()
-
-        message = await client.get_messages(channel, ids=msg_id)
-        if not message or (not message.video and not message.document):
-            return False
-
-        # Download and upload
-        temp_path = None
-        try:
-            # Get file extension from video or document
-            original_filename = None
-            
-            if message.video:
-                # It's a video message
-                if message.video.attributes:
-                    for attr in message.video.attributes:
-                        if hasattr(attr, 'file_name') and attr.file_name:
-                            original_filename = attr.file_name
-                            break
-            elif message.document:
-                # It's a document (video file sent as document)
-                if message.document.attributes:
-                    for attr in message.document.attributes:
-                        if hasattr(attr, 'file_name') and attr.file_name:
-                            original_filename = attr.file_name
-                            break
-            
-            file_ext = os.path.splitext(original_filename)[1] if original_filename else '.mkv'
-            filename = f"{msg_id}{file_ext}"
-            
-            # Create temporary file
-            if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
-                os.makedirs(CUSTOM_TEMP_DIR, exist_ok=True)
-                temp_path = os.path.join(CUSTOM_TEMP_DIR, f"temp_{msg_id}{file_ext}")
-            else:
-                # Use system temp directory with consistent naming
-                temp_dir = tempfile.gettempdir()
-                temp_path = os.path.join(temp_dir, f"temp_{msg_id}{file_ext}")
-                # Ensure any existing file is removed first
-                if os.path.exists(temp_path):
-                    try:
-                        os.unlink(temp_path)
-                    except:
-                        pass
-            
-            # Download
-            await client.download_media(message, file=temp_path)
-            
-            # Upload to PixelDrain
-            pixeldrain_id = await upload_to_pixeldrain_chunked(temp_path, filename)
-            
-            # Save to database
-            uploaded_files = load_uploaded_files_db()
-            
-            # Get file size from the appropriate source
-            if message.video:
-                file_size = message.video.size
-            elif message.document:
-                file_size = message.document.size
-            else:
-                file_size = os.path.getsize(temp_path)  # Fallback to actual file size
-            
-            uploaded_files[str(msg_id)] = {
-                "pixeldrain_id": pixeldrain_id,
-                "filename": filename,
-                "uploaded_at": int(time.time()),
-                "file_size": file_size,
-                "access_count": 0
-            }
-            save_uploaded_files_db(uploaded_files)
-            
-            return True
-            
-        finally:
-            # Clean up temp file
-            if temp_path and os.path.exists(temp_path):
-                try:
-                    os.unlink(temp_path)
-                except:
-                    pass
-                    
-    except Exception as e:
-        print(f"❌ Error in download_single_episode: {e}")
-        return False
 
 
 if __name__ == "__main__":

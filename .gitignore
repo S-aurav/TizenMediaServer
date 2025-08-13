@@ -186,3 +186,5 @@ test_simple_gist.py
 test_tv_endpoint.py
 optimize_server.py
 imghdr_polyfill.py
+mobile_client.html
+github_gist_manager.py

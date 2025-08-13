@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamFlix - Your Personal Streaming Platform</title>
+    <link rel="stylesheet" href="/mobile/styles.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Main App Container -->
+    <div id="app">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <h1>StreamFlix</h1>
+                </div>
+                <nav class="nav">
+                    <a href="#" class="nav-link active">Home</a>
+                </nav>
+                <div class="user-controls">
+                    <button class="search-btn">🔍</button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Hero Section -->
+        <section class="hero" id="hero">
+            <div class="hero-content">
+                <h1 class="hero-title" id="heroTitle">Featured Series</h1>
+                <p class="hero-description" id="heroDescription">Discover amazing episodes from your favorite series</p>
+                <div class="hero-buttons">
+                    <button class="btn btn-primary" id="heroPlayBtn">▶ Play</button>
+                    <button class="btn btn-secondary" id="heroInfoBtn">ℹ More Info</button>
+                </div>
+            </div>
+            <div class="hero-background">
+                <img id="heroImage" src="" alt="Hero Background" class="hero-bg-image">
+                <div class="hero-gradient"></div>
+            </div>
+            <!-- Slideshow indicators -->
+            <div class="slideshow-indicators" id="slideshowIndicators">
+                <!-- Dots will be added dynamically -->
+            </div>
+        </section>
+
+        <!-- Content Sections -->
+        <main class="main-content">
+            <!-- Series Catalog -->
+            <section class="content-row">
+                <h2 class="row-title">All Series</h2>
+                <div class="series-grid" id="seriesGrid">
+                    <!-- Series cards will be populated here -->
+                </div>
+            </section>
+        </main>
+
+        <!-- Loading Spinner -->
+        <div class="loading-overlay" id="loadingOverlay">
+            <div class="spinner"></div>
+            <p>Loading...</p>
+        </div>
+    </div>
+
+    <!-- Series Detail Modal -->
+    <div class="modal-overlay" id="seriesModal">
+        <div class="modal-content series-modal">
+            <button class="modal-close" id="closeSeriesModal">×</button>
+            
+            <div class="series-header">
+                <div class="series-poster">
+                    <img id="seriesPosterImg" src="" alt="Series Poster">
+                </div>
+                <div class="series-info">
+                    <h1 id="seriesTitle">Series Title</h1>
+                    <div class="series-meta">
+                        <span id="seriesSeasonCount">0 Seasons</span>
+                        <span id="seriesEpisodeCount">0 Episodes</span>
+                    </div>
+                    <p id="seriesDescription">Series description will appear here...</p>
+                    <div class="series-actions">
+                        <button class="btn btn-primary" id="playFirstEpisode">▶ Play</button>
+                        <button class="btn btn-secondary" id="downloadAllSeries">⬇ Download All</button>
+                    </div>
+                </div>
+            </div>
+
+            <div class="series-content">
+                <!-- Season Selector -->
+                <div class="season-selector">
+                    <label for="seasonSelect">Select Season:</label>
+                    <select id="seasonSelect" class="season-dropdown">
+                        <option value="">Choose a season...</option>
+                    </select>
+                    <button class="btn btn-secondary season-download-btn" id="downloadSeasonBtn">⬇ Download Season</button>
+                </div>
+
+                <!-- Episodes List -->
+                <div class="episodes-list" id="episodesList">
+                    <!-- Episodes will be populated here -->
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Video Player Modal -->
+    <div class="modal-overlay video-modal-overlay" id="videoModal">
+        <div class="video-modal-content">
+            <button class="modal-close video-modal-close" id="closeVideoModal">×</button>
+            
+            <div class="video-container">
+                <video id="videoPlayer" class="video-player">
+                    <source src="" type="video/mp4">
+                </video>
+                
+                <!-- Custom Controls Overlay -->
+                <div class="controls-overlay" id="controlsOverlay">
+                    <!-- Play/Pause Button -->
+                    <div class="play-pause-container">
+                        <button class="play-pause-btn" id="playPauseBtn">
+                            <svg class="play-icon" viewBox="0 0 24 24">
+                                <path d="M8 5v14l11-7z"/>
+                            </svg>
+                            <svg class="pause-icon hidden" viewBox="0 0 24 24">
+                                <path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/>
+                            </svg>
+                        </button>
+                    </div>
+                    
+                    <!-- Bottom Controls -->
+                    <div class="bottom-controls">
+                        <!-- Progress Bar -->
+                        <div class="progress-container">
+                            <div class="progress-bar" id="progressBar">
+                                <div class="progress-buffer" id="progressBuffer"></div>
+                                <div class="progress-filled" id="progressFilled"></div>
+                                <div class="progress-handle" id="progressHandle"></div>
+                            </div>
+                        </div>
+                        
+                        <!-- Control Buttons -->
+                        <div class="control-buttons">
+                            <div class="left-controls">
+                                <button class="control-btn" id="playPauseBtn2">⏯</button>
+                                <button class="control-btn" id="volumeBtn">🔊</button>
+                                <div class="volume-slider-container">
+                                    <input type="range" class="volume-slider" id="volumeSlider" min="0" max="100" value="100">
+                                </div>
+                                <span class="time-display" id="timeDisplay">0:00 / 0:00</span>
+                            </div>
+                            
+                            <div class="right-controls">
+                                <button class="control-btn" id="nextEpisodeBtn">⏭</button>
+                                <button class="control-btn" id="fullscreenBtn">⛶</button>
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Loading Spinner -->
+                    <div class="loading-spinner hidden" id="loadingSpinner">
+                        <div class="spinner"></div>
+                    </div>
+                    
+                    <!-- Video Info Overlay -->
+                    <div class="video-info">
+                        <h1 class="video-title" id="videoTitle">Episode Title</h1>
+                        <p class="video-description" id="videoDescription">Episode description...</p>
+                    </div>
+
+                    <!-- Audio Tracks Drawer -->
+                <div class="audio-tracks-drawer" id="audioTracksDrawer">
+                    <div class="audio-tracks-header">
+                        <h3>Audio Tracks</h3>
+                        <button class="close-drawer-btn" id="closeAudioDrawer">×</button>
+                    </div>
+                    <div class="audio-tracks-list" id="audioTracksList">
+                        <!-- Audio tracks will be populated here -->
+                        <div class="no-tracks-message">
+                            <p>No additional audio tracks available</p>
+                        </div>
+                    </div>
+                </div>
+
+                <!-- Audio Tracks Overlay (for mobile) -->
+                <div class="audio-tracks-overlay" id="audioTracksOverlay">
+                    <div class="audio-tracks-modal">
+                        <div class="audio-tracks-header">
+                            <h3>Select Audio Track</h3>
+                            <button class="close-drawer-btn" id="closeAudioOverlay">×</button>
+                        </div>
+                        <div class="audio-tracks-list" id="audioTracksListMobile">
+                            <!-- Audio tracks will be populated here for mobile -->
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast Notifications -->
+    <div class="toast-container" id="toastContainer">
+        <!-- Toast messages will appear here -->
+    </div>
+
+    <script src="/mobile/app.js"></script>
+</body>
+</html>
