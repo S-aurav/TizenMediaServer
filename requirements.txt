@@ -1,8 +1,9 @@
 fastapi==0.104.1
 uvicorn==0.24.0
-telethon==1.30.3
+telethon==1.36.0
 python-dotenv==1.0.0
 aiofiles==23.2.1
 httpx==0.25.2
 requests==2.31.0
 aiohttp
+imghdr-polyfill==1.0.0
