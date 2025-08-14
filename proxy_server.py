@@ -959,15 +959,194 @@ async def root():
 # Add info endpoint
 @app.get("/")
 async def root():
-    """Root endpoint with service information"""
+    """Root endpoint with complete service information and API documentation"""
     return {
         "service": "Smart TV Streaming Server",
+        "version": "1.0.0",
         "status": "running",
         "endpoints": {
-            "catalog": "/catalog/series",
-            "download": "/download?url=TELEGRAM_URL",
-            "stream_local": "/stream_local/{msg_id}",
-            "health": "/health"
+            "catalog": {
+                "list_series": {
+                    "path": "/catalog/series",
+                    "method": "GET",
+                    "description": "List all available series"
+                },
+                "list_seasons": {
+                    "path": "/catalog/series/{series_name}",
+                    "method": "GET",
+                    "description": "List seasons for a specific series"
+                },
+                "list_episodes": {
+                    "path": "/catalog/series/{series_name}/{season_name}",
+                    "method": "GET",
+                    "description": "List episodes for a specific season"
+                },
+                "get_episode": {
+                    "path": "/catalog/episode/{msg_id}",
+                    "method": "GET",
+                    "description": "Get episode information by message ID"
+                }
+            },
+            "downloads": {
+                "trigger_download": {
+                    "path": "/download?url={telegram_url}",
+                    "method": "GET",
+                    "description": "Queue a single episode download (HIGH priority)"
+                },
+                "list_downloads": {
+                    "path": "/downloads",
+                    "method": "GET",
+                    "description": "List all downloaded files"
+                },
+                "season_download": {
+                    "path": "/download/season?series_name={series_name}&season_name={season_name}",
+                    "method": "POST",
+                    "description": "Download all episodes from a season"
+                },
+                "season_status": {
+                    "path": "/download/season/status",
+                    "method": "GET",
+                    "description": "Get status of all season downloads"
+                },
+                "cancel_season": {
+                    "path": "/download/season/{season_id}",
+                    "method": "DELETE",
+                    "description": "Cancel a season download"
+                },
+                "download_progress": {
+                    "path": "/download/progress/{msg_id}",
+                    "method": "GET",
+                    "description": "Get basic download progress"
+                },
+                "real_progress": {
+                    "path": "/download/real_progress/{msg_id}",
+                    "method": "GET",
+                    "description": "Get accurate download progress with file size"
+                },
+                "file_info": {
+                    "path": "/download/file_info/{msg_id}",
+                    "method": "GET",
+                    "description": "Get file information from Telegram"
+                }
+            },
+            "streaming": {
+                "stream_local": {
+                    "path": "/stream_local/{msg_id}",
+                    "method": "GET",
+                    "description": "Stream a downloaded file from PixelDrain for TV"
+                },
+                "stream_mobile": {
+                    "path": "/stream_mobile/{msg_id}",
+                    "method": "GET",
+                    "description": "Stream/download simultaneously for mobile devices"
+                },
+                "get_stream_url": {
+                    "path": "/get_stream_url/{msg_id}",
+                    "method": "GET",
+                    "description": "Get direct PixelDrain URL for streaming"
+                }
+            },
+            "queue": {
+                "queue_status": {
+                    "path": "/queue/status",
+                    "method": "GET",
+                    "description": "Get current download queue status"
+                }
+            },
+            "system": {
+                "health_check": {
+                    "path": "/health",
+                    "method": "GET",
+                    "description": "Health check endpoint for deployment platforms"
+                },
+                "storage_info": {
+                    "path": "/storage/info",
+                    "method": "GET",
+                    "description": "Get PixelDrain storage information"
+                },
+                "files_status": {
+                    "path": "/files/status",
+                    "method": "GET",
+                    "description": "Get overview of file storage status"
+                },
+                "cleanup_expired": {
+                    "path": "/cleanup/expired",
+                    "method": "POST",
+                    "description": "Manually trigger cleanup of expired files"
+                }
+            },
+            "performance": {
+                "memory_usage": {
+                    "path": "/performance/memory",
+                    "method": "GET",
+                    "description": "Check current memory usage and chunked download settings"
+                },
+                "test_performance": {
+                    "path": "/performance/test",
+                    "method": "GET",
+                    "description": "Test download performance and suggest optimal chunk sizes"
+                },
+                "configure_chunks": {
+                    "path": "/performance/configure?max_chunk_mb={max}&default_chunk_mb={default}&adaptive={bool}",
+                    "method": "POST",
+                    "description": "Dynamically configure chunk sizes"
+                },
+                "test_upload": {
+                    "path": "/test/chunked_upload?size_mb={size}",
+                    "method": "GET",
+                    "description": "Test memory-safe chunked upload"
+                }
+            },
+            "gist": {
+                "gist_status": {
+                    "path": "/gist/status",
+                    "method": "GET",
+                    "description": "Get Gist synchronization status"
+                },
+                "manual_sync": {
+                    "path": "/gist/sync",
+                    "method": "POST",
+                    "description": "Manually trigger Gist synchronization"
+                },
+                "force_update": {
+                    "path": "/gist/force_update/{filename}",
+                    "method": "POST",
+                    "description": "Force update a specific file from Gist"
+                }
+            },
+            "debug": {
+                "database": {
+                    "path": "/debug/database",
+                    "method": "GET",
+                    "description": "Check uploaded files database"
+                },
+                "temp_progress": {
+                    "path": "/debug/temp_progress/{msg_id}",
+                    "method": "GET",
+                    "description": "Debug temp file progress"
+                },
+                "episode_debug": {
+                    "path": "/debug/episode/{msg_id}",
+                    "method": "GET",
+                    "description": "Debug specific episode"
+                },
+                "temp_files": {
+                    "path": "/temp/files",
+                    "method": "GET",
+                    "description": "List all temp files for debugging"
+                }
+            },
+            "webapp": {
+                "mobile": {
+                    "path": "/mobile",
+                    "method": "GET",
+                    "description": "Netflix-like mobile webapp"
+                }
+            }
+        },
+        "static_paths": {
+            "static_assets": "/static/",
+            "mobile_assets": "/mobile/"
         }
     }
 
