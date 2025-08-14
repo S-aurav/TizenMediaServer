@@ -435,31 +435,126 @@ class StreamFlixApp {
     async playEpisode(episode) {
         try {
             this.currentEpisode = episode;
-            
-            // Close series modal
             this.closeSeriesModal();
-            
-            // Show video modal
             this.openVideoModal();
             
             // Update video info
             document.getElementById('videoTitle').textContent = episode.title;
             document.getElementById('videoDescription').textContent = episode.description || '';
             
-            // Check if episode is downloaded
-            if (episode.downloaded) {
-                // Use existing streaming endpoint
-                this.loadVideoSource(`${this.apiBase}/stream_local/${episode.msg_id}`, episode.title);
-            } else {
-                // Use mobile streaming endpoint for simultaneous download/stream
-                this.loadVideoSource(`${this.apiBase}/stream_mobile/${episode.msg_id}`, episode.title);
-                this.showToast('Starting download and streaming...', 'info');
+            // Show loading spinner
+            if (this.player && this.player.showLoading) {
+                this.player.showLoading();
             }
             
+            // Check if episode is downloaded
+            if (episode.downloaded) {
+                // Use existing streaming endpoint for downloaded episodes
+                this.loadVideoSource(`${this.apiBase}/stream_local/${episode.msg_id}`, episode.title);
+            } else {
+                // For non-downloaded episodes, check download progress first
+                this.showToast('Starting download and streaming...', 'info');
+                
+                // Start download and monitor progress
+                await this.monitorStreamProgress(episode.msg_id, episode.title);
+            }
         } catch (error) {
             this.showToast('Failed to start episode', 'error');
             console.error('Error playing episode:', error);
         }
+    }
+
+    async monitorStreamProgress(msg_id, title) {
+        const minBufferPercentage = 3; // Wait for 3% buffer before playing
+        let attempts = 0;
+        let lastPercentage = 0;
+        
+        // Show initial loading
+        this.showToast('Starting download and buffering...', 'info');
+        
+        // IMPORTANT: First trigger the download by hitting the streaming endpoint
+        try {
+            // This will trigger the download on the server side
+            await fetch(`${this.apiBase}/stream_mobile/${msg_id}`, { method: 'HEAD' });
+            
+            // Give the server a moment to start the download
+            await new Promise(resolve => setTimeout(resolve, 2000));
+        } catch (error) {
+            console.log('Preflight request completed');
+            // Ignore errors, we just want to trigger the download
+        }
+        
+        const checkProgress = async () => {
+            try {
+                // Use the real progress endpoint to check download status
+                const response = await fetch(`${this.apiBase}/download/real_progress/${msg_id}`);
+                const progress = await response.json();
+                
+                if (!progress.downloading) {
+                    attempts++;
+                    
+                    if (attempts >= 5) {
+                        // After several attempts, try to trigger download directly
+                        this.showToast('Download not starting, trying alternate method...', 'warning');
+                        
+                        try {
+                            // Try to find episode URL and trigger download directly
+                            const catalogResponse = await fetch(`${this.apiBase}/catalog/episode/${msg_id}`);
+                            const episodeInfo = await catalogResponse.json();
+                            
+                            if (episodeInfo && episodeInfo.url) {
+                                await fetch(`${this.apiBase}/download?url=${encodeURIComponent(episodeInfo.url)}`);
+                                this.showToast('Download triggered, please wait...', 'info');
+                                
+                                // Give it time to start
+                                await new Promise(resolve => setTimeout(resolve, 3000));
+                            }
+                        } catch (err) {
+                            console.error('Failed to trigger download directly:', err);
+                        }
+                    }
+                    
+                    if (attempts < 15) {
+                        // Keep checking for a while
+                        this.showToast('Waiting for download to start...', 'info');
+                        setTimeout(checkProgress, 2000);
+                    } else {
+                        this.showToast('Download failed to start. Please try again later.', 'error');
+                    }
+                    return;
+                }
+                
+                const percentage = progress.percentage || 0;
+                
+                // Show progress updates (but not too frequently)
+                if (Math.floor(percentage) > Math.floor(lastPercentage)) {
+                    lastPercentage = percentage;
+                    this.showToast(`Buffering: ${percentage.toFixed(1)}%`, 'info');
+                }
+                
+                // Check if we have enough buffer to start playing
+                if (percentage >= minBufferPercentage) {
+                    this.showToast(`Starting playback (${percentage.toFixed(1)}% buffered)`, 'success');
+                    this.loadVideoSource(`${this.apiBase}/stream_mobile/${msg_id}`, title);
+                    return;
+                }
+                
+                // Continue checking
+                attempts++;
+                setTimeout(checkProgress, 1000); // Check every second
+                
+            } catch (error) {
+                console.error('Error checking download progress:', error);
+                if (attempts < 30) { // Try for 30 seconds max
+                    setTimeout(checkProgress, 2000); // Retry with longer timeout
+                } else {
+                    this.showToast('Buffering failed. Please try again later.', 'error');
+                }
+            }
+    };
+    
+    // Start checking
+    checkProgress();
     }
     
     loadVideoSource(url, title) {
@@ -479,10 +574,33 @@ class StreamFlixApp {
         } catch (error) {
             console.error('Error showing loading:', error);
         }
+
+        // Add error event listeners to diagnose problems
+        video.addEventListener('error', (e) => {
+            console.error('Video error:', video.error);
+            this.showToast(`Video error: ${video.error ? video.error.message : 'Unknown error'}`, 'error');
+        }, {once: true});
+        
+        source.addEventListener('error', (e) => {
+            console.error('Source error:', e);
+            this.showToast('Source failed to load', 'error');
+        }, {once: true});
         
         // Set video source
         source.src = url;
+        source.type = 'video/mp4';
         video.load();
+
+        // Monitor loading states
+        video.addEventListener('loadstart', () => console.log('Video loadstart'), {once: true});
+        video.addEventListener('loadeddata', () => console.log('Video loadeddata'), {once: true});
+        video.addEventListener('canplay', () => {
+            console.log('Video canplay - attempting to play');
+            video.play().catch(err => {
+                console.error('Play error:', err);
+                this.showToast(`Play error: ${err}`, 'error');
+            });
+        }, {once: true});
         
         // Update title
         const videoTitle = document.getElementById('videoTitle');

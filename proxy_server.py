@@ -118,11 +118,15 @@ async def gist_sync_middleware(request: Request, call_next):
     response = await call_next(request)
     return response
 
+
+# Get absolute path to the mobile directory
+mobile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mobile")
+
 # Static folder for poster images
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Mount mobile webapp files
-app.mount("/mobile", StaticFiles(directory="mobile"), name="mobile")
+# Mobile client
+app.mount("/mobile", StaticFiles(directory=mobile_path), name="mobile_static")
 
 POSTERS = {
     "Shinchan": "/static/shinchan.jpg",
@@ -1939,37 +1943,35 @@ async def stream_mobile_head(msg_id: str):
         raise HTTPException(500, str(e))
 
 
+@app.get("/catalog/episode/{msg_id}")
+async def get_episode_by_msg_id(msg_id: str):
+    """Get episode information by message ID"""
+    try:
+        msg_id_int = int(msg_id)
+        with open("video.json", encoding="utf-8") as f:
+            data = json.load(f)
+            for series_name, series_data in data.items():
+                for season_name, episodes in series_data.items():
+                    for episode in episodes:
+                        _, ep_msg_id = parse_telegram_url(episode["url"])
+                        if ep_msg_id == msg_id_int:
+                            return {
+                                "url": episode["url"],
+                                "title": episode.get("title", "Unknown"),
+                                "description": episode.get("description", ""),
+                                "msg_id": msg_id
+                            }
+        return {"error": "Episode not found"}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
 @app.get("/mobile")
 async def serve_mobile_webapp():
     """Serve the Netflix-like mobile webapp"""
     return FileResponse("mobile/index.html", media_type="text/html")
 
-# Alternative endpoint for direct access to webapp files
-@app.get("/mobile/{file_path:path}")
-async def serve_mobile_files(file_path: str):
-    """Serve individual mobile webapp files"""
-    import os
-    from fastapi.responses import FileResponse, HTMLResponse
-    
-    # Security check - prevent directory traversal
-    if ".." in file_path or file_path.startswith("/"):
-        raise HTTPException(404, "File not found")
-    
-    file_full_path = os.path.join("mobile", file_path)
-    
-    # Check if file exists
-    if not os.path.exists(file_full_path):
-        raise HTTPException(404, "File not found")
-    
-    # Determine content type
-    if file_path.endswith('.html'):
-        return FileResponse(file_full_path, media_type="text/html")
-    elif file_path.endswith('.css'):
-        return FileResponse(file_full_path, media_type="text/css")
-    elif file_path.endswith('.js'):
-        return FileResponse(file_full_path, media_type="application/javascript")
-    else:
-        return FileResponse(file_full_path)
 
 if __name__ == "__main__":
     import uvicorn

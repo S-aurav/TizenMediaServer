@@ -6,4 +6,3 @@ aiofiles==23.2.1
 httpx==0.25.2
 requests==2.31.0
 aiohttp
-imghdr-polyfill==1.0.0
