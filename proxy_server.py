@@ -942,23 +942,6 @@ async def health_check():
 # Add info endpoint
 @app.get("/")
 async def root():
-    """Root endpoint with service information"""
-    return {
-        "service": "Smart TV Streaming Server",
-        "status": "running",
-        "endpoints": {
-            "catalog": "/catalog/series",
-            "download": "/download?url=TELEGRAM_URL",
-            "stream_direct": "/stream_direct/{msg_id}",
-            "stream_local": "/stream_local/{msg_id}",
-            "hls": "/hls/{msg_id}/playlist.m3u8",
-            "health": "/health"
-        }
-    }
-
-# Add info endpoint
-@app.get("/")
-async def root():
     """Root endpoint with complete service information and API documentation"""
     return {
         "service": "Smart TV Streaming Server",
