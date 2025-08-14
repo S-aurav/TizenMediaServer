@@ -1976,6 +1976,11 @@ async def serve_mobile_webapp():
 if __name__ == "__main__":
     import uvicorn
     import asyncio
+    import json
+    import requests
+    import sys
+    import os
     
     # Run the FastAPI app
     uvicorn.run(app, host="0.0.0.0", port=8000)
+
