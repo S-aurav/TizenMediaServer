@@ -191,3 +191,6 @@ github_gist_manager.py
 Cartoon/
 EXTERNAL_CRON_SETUP.md
 front-end/
+direct_files/
+hls_streams/
+debug_hls_status.py

@@ -5,8 +5,12 @@ import asyncio
 import tempfile
 import threading
 import time
+import subprocess
+import shutil
+import httpx
+from pathlib import Path
 from typing import List, Dict, Optional
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from telethon import TelegramClient
@@ -16,12 +20,8 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 
 # Import our custom modules
-from download_manager import chunked_download_upload, standard_download_upload, process_season_downloads, download_single_episode
-from upload_manager import upload_to_pixeldrain, check_pixeldrain_file_exists, delete_from_pixeldrain, get_pixeldrain_download_url
 from database_manager import load_uploaded_files_db, save_uploaded_files_db, load_uploaded_files_db_async, save_uploaded_files_db_async, load_video_data, set_gist_manager
 from utils import parse_telegram_url, get_file_extension_from_message, get_file_size_from_message
-from download_scheduler import download_scheduler
-from queue_manager import queue_manager
 
 # Import Gist functionality
 from gist_manager import GistManager, background_sync_task
@@ -44,11 +44,8 @@ TELEGRAM_SESSION_STRING = os.getenv("TELEGRAM_SESSION_STRING")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
 GIST_ID = os.getenv("GIST_ID")
 
-# PixelDrain configuration
-PIXELDRAIN_API_KEY = os.getenv("PIXELDRAIN_API_KEY")  # Optional for better upload limits
-PIXELDRAIN_UPLOAD_URL = "https://pixeldrain.com/api/file"
-PIXELDRAIN_DOWNLOAD_URL = "https://pixeldrain.com/api/file/{file_id}"
-MAX_ACCESS_COUNT = 4  # Maximum times a file can be accessed before expiring
+# File access limits (previously for PixelDrain, now for general usage)
+MAX_ACCESS_COUNT = 4  # Maximum times a file can be accessed before re-download needed
 
 # Database files for tracking episodes
 DOWNLOADED_FILES_DB = "downloaded_episodes.json"
@@ -61,6 +58,14 @@ TEMP_DIR = os.path.join(os.getcwd(), "tmp")
 
 # Streaming configuration
 STREAMING_BUFFER_SIZE = 10 * 1024 * 1024  # 10MB buffer before starting stream
+
+# Direct file serving configuration (Primary approach)
+DIRECT_FILES_DIR = os.path.join(os.getcwd(), "direct_files")
+MAX_STORAGE_MB = 1800  # Maximum storage in MB for ephemeral storage
+direct_file_status = {}  # Track download status for direct files
+
+# Ensure directories exist
+os.makedirs(DIRECT_FILES_DIR, exist_ok=True)
 
 # Memory-optimized chunk sizing for Render's 512MB limit
 CHUNK_SIZE_MIN = 1 * 1024 * 1024          # 1MB minimum chunk (optimized from 2MB)
@@ -138,10 +143,7 @@ POSTERS = {
 
 # Global variables
 client = None
-download_tasks = {}  # message_id -> asyncio.Task
 cleanup_task = None
-season_download_queue = {}  # season_id -> {"episodes": [...], "current_index": 0, "status": "downloading"}
-season_download_task = None
 
 @app.on_event("startup")
 async def startup_event():
@@ -170,13 +172,6 @@ async def startup_event():
             asyncio.create_task(background_sync_task(gist_manager))
             print("🔄 Started background Gist sync task")
         
-        # Initialize PixelDrain configuration
-        print("🎯 Initializing PixelDrain configuration...")
-        if PIXELDRAIN_API_KEY:
-            print("� PixelDrain API key configured - better upload limits available")
-        else:
-            print("⚠️ No PixelDrain API key - using anonymous uploads (limited)")
-        
         # Run initial cleanup of expired files
         print("🧹 Running initial cleanup check...")
         cleaned_count = await cleanup_expired_files()
@@ -185,10 +180,6 @@ async def startup_event():
         # Start periodic cleanup task
         cleanup_task = asyncio.create_task(periodic_cleanup())
         print("⏰ Started periodic cleanup task (runs every 6 hours)")
-        
-        # Initialize download scheduler
-        await download_scheduler.start_scheduler(client)
-        print("✅ Download scheduler started with 4 slots: 3 LOW priority + 1 HIGH priority")
         
     except Exception as e:
         print(f"❌ Failed to connect Telegram client: {e}")
@@ -204,9 +195,816 @@ async def shutdown_event():
     if cleanup_task:
         cleanup_task.cancel()
         print("⏰ Stopped periodic cleanup task")
+
+# ============= DIRECT FILE SERVING FUNCTIONS (Primary Approach) =============
+
+# async def initialize_hls_streaming():
+#     """Initialize HLS streaming system"""
+#     global hls_cleanup_task
     
-    # Stop download scheduler
-    await download_scheduler.stop_scheduler()
+#     try:
+#         # Create HLS output directory
+#         os.makedirs(HLS_OUTPUT_DIR, exist_ok=True)
+#         print(f"📁 HLS output directory: {HLS_OUTPUT_DIR}")
+        
+#         # Check FFmpeg availability
+#         ffmpeg_available = await check_ffmpeg_available()
+#         if ffmpeg_available:
+#             print("✅ FFmpeg is available for HLS conversion")
+#         else:
+#             print("⚠️ FFmpeg not found - HLS streaming will not work")
+#             return False
+        
+#         # Start HLS cleanup task
+#         hls_cleanup_task = asyncio.create_task(periodic_hls_cleanup())
+#         print("🧹 Started HLS cleanup task")
+        
+#         return True
+        
+#     except Exception as e:
+#         print(f"❌ Failed to initialize HLS streaming: {e}")
+#         return False
+
+# async def check_ffmpeg_available():
+#     """Check if FFmpeg is available"""
+#     try:
+#         process = await asyncio.create_subprocess_exec(
+#             FFMPEG_PATH, "-version",
+#             stdout=asyncio.subprocess.PIPE,
+#             stderr=asyncio.subprocess.PIPE
+#         )
+#         stdout, stderr = await process.communicate()
+#         return process.returncode == 0
+#     except Exception:
+#         return False
+
+# async def cleanup_all_hls_processes():
+#     """Stop all running HLS processes"""
+#     global hls_processes, hls_status
+    
+#     print("🛑 Stopping all HLS processes...")
+#     for msg_id, process in hls_processes.items():
+#         try:
+#             if process and process.poll() is None:
+#                 process.terminate()
+#                 print(f"🛑 Terminated HLS process for {msg_id}")
+#         except Exception as e:
+#             print(f"⚠️ Error terminating process {msg_id}: {e}")
+    
+#     hls_processes.clear()
+#     hls_status.clear()
+
+# async def periodic_hls_cleanup():
+#     """Clean up old HLS files periodically"""
+#     while True:
+#         try:
+#             await asyncio.sleep(300)  # Check every 5 minutes
+#             await cleanup_old_hls_files()
+#         except Exception as e:
+#             print(f"❌ Error in HLS cleanup: {e}")
+
+# async def cleanup_old_hls_files():
+#     """Remove HLS files older than HLS_CLEANUP_AFTER seconds"""
+#     try:
+#         current_time = time.time()
+#         cleaned_files = 0
+        
+#         for msg_id_dir in os.listdir(HLS_OUTPUT_DIR):
+#             dir_path = os.path.join(HLS_OUTPUT_DIR, msg_id_dir)
+#             if os.path.isdir(dir_path):
+#                 # Check if directory is old enough to clean
+#                 dir_mtime = os.path.getmtime(dir_path)
+#                 if current_time - dir_mtime > HLS_CLEANUP_AFTER:
+#                     # Stop any running process for this msg_id
+#                     if msg_id_dir in hls_processes:
+#                         process = hls_processes[msg_id_dir]
+#                         if process and process.poll() is None:
+#                             process.terminate()
+#                         del hls_processes[msg_id_dir]
+                    
+#                     if msg_id_dir in hls_status:
+#                         del hls_status[msg_id_dir]
+                    
+#                     # Remove directory
+#                     shutil.rmtree(dir_path)
+#                     cleaned_files += 1
+#                     print(f"🧹 Cleaned up old HLS stream: {msg_id_dir}")
+        
+#         if cleaned_files > 0:
+#             print(f"🧹 HLS cleanup completed: {cleaned_files} old streams removed")
+            
+#     except Exception as e:
+#         print(f"❌ Error cleaning HLS files: {e}")
+
+# async def start_hls_conversion(msg_id: str, input_source: str, quality: str = "720p"):
+#     """Start HLS conversion for a video source"""
+#     global hls_processes, hls_status
+    
+#     try:
+#         # Create output directory for this stream
+#         output_dir = os.path.join(HLS_OUTPUT_DIR, msg_id)
+#         os.makedirs(output_dir, exist_ok=True)
+        
+#         # Set quality parameters
+#         quality_settings = HLS_QUALITIES.get(quality, HLS_QUALITIES["720p"])
+        
+#         # FFmpeg command for HLS conversion
+#         ffmpeg_cmd = [
+#             FFMPEG_PATH,
+#             "-i", input_source,
+#             "-c:v", "libx264",
+#             "-preset", "fast",
+#             "-crf", "23",
+#             "-c:a", "aac",
+#             "-b:v", quality_settings["bitrate"],
+#             "-b:a", quality_settings["audio_bitrate"],
+#             "-s", quality_settings["resolution"],
+#             "-f", "hls",
+#             "-hls_time", str(HLS_SEGMENT_DURATION),
+#             "-hls_list_size", str(HLS_PLAYLIST_SIZE),
+#             "-hls_flags", "independent_segments",
+#             "-hls_playlist_type", "vod",  # Video on Demand - keeps all segments
+#             "-hls_segment_filename", os.path.join(output_dir, "segment_%03d.ts"),
+#             os.path.join(output_dir, "playlist.m3u8")
+#         ]
+        
+#         print(f"🎬 Starting HLS conversion for {msg_id} ({quality})")
+#         print(f"📁 Output directory: {output_dir}")
+#         print(f"🔧 FFmpeg command: {' '.join(ffmpeg_cmd)}")
+        
+#         # Start FFmpeg process
+#         process = await asyncio.create_subprocess_exec(
+#             *ffmpeg_cmd,
+#             stdout=asyncio.subprocess.PIPE,
+#             stderr=asyncio.subprocess.PIPE
+#         )
+        
+#         hls_processes[msg_id] = process
+#         hls_status[msg_id] = {
+#             "status": "converting",
+#             "quality": quality,
+#             "output_dir": output_dir,
+#             "started_at": time.time()
+#         }
+        
+#         print(f"✅ FFmpeg process started for {msg_id} (PID: {process.pid})")
+#         return True
+        
+#     except Exception as e:
+#         error_msg = f"Failed to start HLS conversion: {str(e)}"
+#         print(f"❌ {error_msg}")
+#         print(f"❌ Error type: {type(e).__name__}")
+#         import traceback
+#         print(f"❌ Traceback: {traceback.format_exc()}")
+#         hls_status[msg_id] = {"status": "error", "error": error_msg}
+        # return False
+
+# async def download_and_convert_to_hls(msg_id: str, quality: str = "720p"):
+#     """Download from Telegram and convert to HLS"""
+#     global hls_status, client
+    
+#     try:
+#         print(f"🎬 Starting HLS conversion process for {msg_id} ({quality})")
+        
+#         # Load video data to find the Telegram message
+#         data = await load_video_data()
+#         episode_info = None
+        
+#         # Find the episode with this msg_id
+#         for series_name, series_data in data.items():
+#             for season_name, episodes in series_data.items():
+#                 for episode in episodes:
+#                     _, ep_msg_id = parse_telegram_url(episode["url"])
+#                     if str(ep_msg_id) == str(msg_id):
+#                         episode_info = {
+#                             "channel": episode["url"].split("/")[-2],
+#                             "msg_id": ep_msg_id,
+#                             "title": episode.get("title", f"Episode {msg_id}")
+#                         }
+#                         break
+#                 if episode_info:
+#                     break
+#             if episode_info:
+#                 break
+        
+#         if not episode_info:
+#             error_msg = "Episode not found in catalog"
+#             print(f"❌ {error_msg}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+#             return False
+        
+#         print(f"📁 Found episode: {episode_info['title']} from channel {episode_info['channel']}")
+        
+#         # Check if client is connected
+#         if not client or not client.is_connected():
+#             error_msg = "Telegram client not connected"
+#             print(f"❌ {error_msg}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+#             return False
+        
+#         # Download from Telegram to temp location
+#         print(f"📥 Starting download from Telegram...")
+#         hls_status[msg_id] = {"status": "downloading", "progress": 0}
+        
+#         temp_file = os.path.join(tempfile.gettempdir(), f"hls_temp_{msg_id}.mp4")
+        
+#         # Get message from Telegram
+#         try:
+#             message = await client.get_messages(episode_info["channel"], ids=episode_info["msg_id"])
+#             if not message:
+#                 error_msg = "Message not found on Telegram"
+#                 print(f"❌ {error_msg}")
+#                 hls_status[msg_id] = {"status": "error", "error": error_msg}
+#                 return False
+            
+#             # Check if it's a media message
+#             if not (message.video or message.document):
+#                 error_msg = "Message does not contain video file"
+#                 print(f"❌ {error_msg}")
+#                 hls_status[msg_id] = {"status": "error", "error": error_msg}
+#                 return False
+            
+#             # Get file size for progress tracking
+#             file_size = message.file.size if message.file else 0
+#             print(f"📏 File size: {file_size / (1024*1024):.1f} MB")
+            
+#             # Download with progress tracking
+#             downloaded_size = 0
+            
+#             def progress_callback(current, total):
+#                 nonlocal downloaded_size
+#                 downloaded_size = current
+#                 if total > 0:
+#                     progress = (current / total) * 50  # 50% for download
+#                     hls_status[msg_id] = {"status": "downloading", "progress": progress}
+#                     # Log progress every 25MB to reduce spam
+#                     if current % (25 * 1024 * 1024) < 1024 * 1024:
+#                         print(f"📊 Downloaded: {current / (1024*1024):.1f} MB / {total / (1024*1024):.1f} MB ({progress:.1f}%)")
+            
+#             # Download the file with timeout protection
+#             print(f"💾 Downloading to: {temp_file}")
+            
+#             try:
+#                 # Use asyncio.wait_for to add timeout protection
+#                 await asyncio.wait_for(
+#                     client.download_media(message, file=temp_file, progress_callback=progress_callback),
+#                     timeout=1800  # 30 minutes timeout for large files
+#                 )
+#             except asyncio.TimeoutError:
+#                 error_msg = "Download timeout - file too large or connection slow"
+#                 print(f"❌ {error_msg}")
+#                 hls_status[msg_id] = {"status": "error", "error": error_msg}
+#                 return False
+            
+#             if not os.path.exists(temp_file):
+#                 error_msg = "Download failed - file not created"
+#                 print(f"❌ {error_msg}")
+#                 hls_status[msg_id] = {"status": "error", "error": error_msg}
+#                 return False
+            
+#             print(f"✅ Downloaded {msg_id} to temp file: {temp_file} ({os.path.getsize(temp_file)} bytes)")
+            
+#         except Exception as download_error:
+#             error_msg = f"Telegram download failed: {str(download_error)}"
+#             print(f"❌ {error_msg}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+#             return False
+        
+#         # Start HLS conversion
+#         print(f"🎬 Starting HLS conversion...")
+#         hls_status[msg_id] = {"status": "converting", "progress": 50}
+#         success = await start_hls_conversion(msg_id, temp_file, quality)
+        
+#         if success:
+#             print(f"✅ HLS conversion started successfully")
+#             # Monitor conversion progress
+#             await monitor_hls_conversion(msg_id)
+#         else:
+#             error_msg = "Failed to start HLS conversion"
+#             print(f"❌ {error_msg}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+        
+#         # Clean up temp file
+#         try:
+#             if os.path.exists(temp_file):
+#                 os.unlink(temp_file)
+#                 print(f"🧹 Cleaned up temp file: {temp_file}")
+#         except Exception as cleanup_error:
+#             print(f"⚠️ Temp file cleanup warning: {cleanup_error}")
+        
+#         return success
+        
+#     except Exception as e:
+#         error_msg = f"Unexpected error: {str(e)}"
+#         print(f"❌ Error in download_and_convert_to_hls for {msg_id}: {e}")
+#         print(f"❌ Error type: {type(e).__name__}")
+#         import traceback
+#         print(f"❌ Traceback: {traceback.format_exc()}")
+#         hls_status[msg_id] = {"status": "error", "error": error_msg}
+#         return False
+
+# async def download_and_convert_to_hls_progressive(msg_id: str, quality: str = "720p"):
+#     """Progressive HLS: Download and convert with chunked approach"""
+#     global hls_status, client
+    
+#     try:
+#         print(f"🚀 Starting CHUNKED PROGRESSIVE HLS conversion for {msg_id} ({quality})")
+        
+#         # Load video data to find the Telegram message
+#         data = await load_video_data()
+#         episode_info = None
+        
+#         # Find the episode with this msg_id
+#         for series_name, series_data in data.items():
+#             for season_name, episodes in series_data.items():
+#                 for episode in episodes:
+#                     _, ep_msg_id = parse_telegram_url(episode["url"])
+#                     if ep_msg_id == int(msg_id):
+#                         episode_info = {
+#                             "url": episode["url"],
+#                             "title": episode.get("title", f"Episode {msg_id}"),
+#                             "series": series_name,
+#                             "season": season_name
+#                         }
+#                         break
+#                 if episode_info:
+#                     break
+#             if episode_info:
+#                 break
+        
+#         if not episode_info:
+#             error_msg = f"Episode with msg_id {msg_id} not found"
+#             print(f"❌ {error_msg}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+#             return False
+        
+#         # Set up progressive conversion
+#         hls_status[msg_id] = {
+#             "status": "initializing",
+#             "progress": 0,
+#             "stage": "preparing_chunked_conversion"
+#         }
+        
+#         # Create output directory
+#         output_dir = os.path.join(HLS_OUTPUT_DIR, msg_id)
+#         os.makedirs(output_dir, exist_ok=True)
+        
+#         # Create temporary file for complete download first
+#         os.makedirs(TEMP_DIR, exist_ok=True)
+#         temp_file = os.path.join(TEMP_DIR, f"chunked_{msg_id}.mkv")
+        
+#         # Get Telegram message
+#         channel, telegram_msg_id = parse_telegram_url(episode_info["url"])
+#         message = await client.get_messages(channel, ids=telegram_msg_id)
+        
+#         if not message or not message.document:
+#             error_msg = "Message or document not found"
+#             print(f"❌ {error_msg}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+#             return False
+        
+#         total_size = message.document.size
+        
+#         # Extract filename properly from document attributes
+#         filename = f"{msg_id}.mkv"  # Default filename
+#         if message.document.attributes:
+#             for attr in message.document.attributes:
+#                 if hasattr(attr, 'file_name') and attr.file_name:
+#                     filename = attr.file_name
+#                     break
+        
+#         print(f"📁 Chunked Progressive File: {filename} ({total_size / 1024 / 1024:.1f} MB)")
+        
+#         # Start download with chunked HLS conversion
+#         hls_status[msg_id] = {
+#             "status": "downloading_and_converting",
+#             "progress": 0,
+#             "total_size": total_size,
+#             "filename": filename,
+#             "stage": "chunked_processing"
+#         }
+        
+#         # Download in chunks and convert each chunk
+#         chunk_size = 50 * 1024 * 1024  # 50MB chunks
+#         downloaded_size = 0
+#         chunk_number = 0
+        
+#         def progress_callback(current, total):
+#             nonlocal downloaded_size
+#             downloaded_size = current
+#             progress = (current / total) * 100
+#             hls_status[msg_id]["progress"] = progress
+#             if int(progress) % 5 == 0:  # Log every 5%
+#                 print(f"📊 Progressive: {current / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({progress:.1f}%)")
+        
+#         # Start download with immediate HLS conversion
+#         conversion_task = asyncio.create_task(
+#             download_with_immediate_hls_conversion(
+#                 message, temp_file, output_dir, quality, msg_id, progress_callback
+#             )
+#         )
+        
+#         # Wait for conversion to complete
+#         success = await conversion_task
+        
+#         if success:
+#             # Verify output
+#             playlist_path = os.path.join(output_dir, "playlist.m3u8")
+#             if os.path.exists(playlist_path):
+#                 segments = [f for f in os.listdir(output_dir) if f.endswith('.ts')]
+#                 hls_status[msg_id] = {
+#                     "status": "completed",
+#                     "progress": 100,
+#                     "playlist_url": f"/hls/{msg_id}/playlist.m3u8",
+#                     "segments": len(segments),
+#                     "type": "chunked_progressive"
+#                 }
+#                 print(f"✅ Chunked Progressive HLS conversion completed: {len(segments)} segments")
+                
+#                 # Clean up temp file
+#                 try:
+#                     if os.path.exists(temp_file):
+#                         os.unlink(temp_file)
+#                 except:
+#                     pass
+                
+#                 return True
+#             else:
+#                 error_msg = "Chunked progressive playlist file not created"
+#                 print(f"❌ {error_msg}")
+#                 hls_status[msg_id] = {"status": "error", "error": error_msg}
+#                 return False
+#         else:
+#             hls_status[msg_id] = {"status": "error", "error": "Chunked conversion failed"}
+#             return False
+            
+#     except Exception as e:
+#         error_msg = f"Chunked progressive conversion error: {str(e)}"
+#         print(f"❌ {error_msg}")
+#         import traceback
+#         print(f"❌ Traceback: {traceback.format_exc()}")
+#         hls_status[msg_id] = {"status": "error", "error": error_msg}
+#         return False
+
+# async def download_with_immediate_hls_conversion(message, temp_file, output_dir, quality, msg_id, progress_callback):
+#     """Download and start HLS conversion immediately, then update as more data arrives"""
+#     try:
+#         print(f"🔄 Starting immediate HLS conversion strategy...")
+        
+#         # Download the file completely first (faster and more reliable)
+#         await client.download_media(
+#             message, 
+#             file=temp_file, 
+#             progress_callback=progress_callback
+#         )
+        
+#         print(f"✅ Download completed, starting HLS conversion...")
+        
+#         # Now convert to HLS (this will be fast since file is complete)
+#         success = await start_hls_conversion(msg_id, temp_file, quality)
+        
+#         if success:
+#             print(f"✅ HLS conversion completed successfully")
+#             return True
+#         else:
+#             print(f"❌ HLS conversion failed")
+#             return False
+            
+#     except Exception as e:
+#         print(f"❌ Error in immediate HLS conversion: {e}")
+#         return False
+
+# async def start_progressive_ffmpeg(msg_id: str, input_file: str, output_dir: str, quality: str):
+#     """Start FFmpeg process that can handle growing input file"""
+#     quality_settings = HLS_QUALITIES.get(quality, HLS_QUALITIES["720p"])
+    
+#     ffmpeg_cmd = [
+#         FFMPEG_PATH,
+#         "-re",  # Read input at native frame rate
+#         "-i", input_file,
+#         "-c:v", "libx264",
+#         "-preset", "veryfast",  # Fast encoding for real-time
+#         "-crf", "23",
+#         "-c:a", "aac",
+#         "-b:v", quality_settings["bitrate"],
+#         "-b:a", quality_settings["audio_bitrate"],
+#         "-s", quality_settings["resolution"],
+#         "-f", "hls",
+#         "-hls_time", "6",  # 6-second segments for faster startup
+#         "-hls_list_size", "0",  # Keep all segments
+#         "-hls_flags", "independent_segments",
+#         "-hls_playlist_type", "event",  # Event playlist grows over time
+#         "-hls_segment_filename", os.path.join(output_dir, "segment_%05d.ts"),
+#         os.path.join(output_dir, "playlist.m3u8")
+#     ]
+    
+#     try:
+#         print(f"🔧 Starting progressive FFmpeg")
+#         process = await asyncio.create_subprocess_exec(
+#             *ffmpeg_cmd,
+#             stdout=asyncio.subprocess.PIPE,
+#             stderr=asyncio.subprocess.PIPE
+#         )
+#         print(f"✅ Progressive FFmpeg started (PID: {process.pid})")
+#         return process
+#     except Exception as e:
+#         print(f"❌ Error starting progressive FFmpeg: {e}")
+#         return None
+
+# async def monitor_hls_conversion(msg_id: str):
+#     """Monitor HLS conversion progress"""
+#     global hls_processes, hls_status
+    
+#     if msg_id not in hls_processes:
+#         error_msg = "No conversion process found"
+#         print(f"❌ {error_msg}")
+#         hls_status[msg_id] = {"status": "error", "error": error_msg}
+#         return
+    
+#     process = hls_processes[msg_id]
+#     print(f"⏱️ Monitoring HLS conversion for {msg_id} (PID: {process.pid})")
+    
+#     try:
+#         # Wait for process to complete
+#         stdout, stderr = await process.communicate()
+        
+#         print(f"🏁 FFmpeg process completed for {msg_id} with return code: {process.returncode}")
+        
+#         if process.returncode == 0:
+#             # Check if playlist file was created
+#             output_dir = hls_status[msg_id].get("output_dir")
+#             playlist_path = os.path.join(output_dir, "playlist.m3u8") if output_dir else None
+            
+#             if playlist_path and os.path.exists(playlist_path):
+#                 # Count segments
+#                 with open(playlist_path, 'r') as f:
+#                     content = f.read()
+#                     segments = [line for line in content.split('\n') if line.endswith('.ts')]
+                
+#                 hls_status[msg_id] = {
+#                     "status": "ready",
+#                     "progress": 100,
+#                     "quality": hls_status[msg_id].get("quality", "720p"),
+#                     "output_dir": output_dir,
+#                     "completed_at": time.time(),
+#                     "segments_count": len(segments)
+#                 }
+#                 print(f"✅ HLS conversion completed for {msg_id}")
+#                 print(f"📺 Created {len(segments)} video segments")
+#                 print(f"📋 Playlist: {playlist_path}")
+#             else:
+#                 error_msg = "Playlist file not created"
+#                 print(f"❌ {error_msg}")
+#                 if stdout:
+#                     print(f"📤 FFmpeg stdout: {stdout.decode()}")
+#                 if stderr:
+#                     print(f"📥 FFmpeg stderr: {stderr.decode()}")
+#                 hls_status[msg_id] = {"status": "error", "error": error_msg}
+#         else:
+#             error_msg = f"FFmpeg failed with return code {process.returncode}"
+#             print(f"❌ {error_msg}")
+#             if stdout:
+#                 print(f"📤 FFmpeg stdout: {stdout.decode()}")
+#             if stderr:
+#                 print(f"📥 FFmpeg stderr: {stderr.decode()}")
+#             hls_status[msg_id] = {"status": "error", "error": error_msg}
+    
+#     except Exception as e:
+#         error_msg = f"Monitor error: {str(e)}"
+#         print(f"❌ Error monitoring HLS conversion for {msg_id}: {e}")
+#         import traceback
+#         print(f"❌ Traceback: {traceback.format_exc()}")
+#         hls_status[msg_id] = {"status": "error", "error": error_msg}
+    
+#     finally:
+#         # Clean up process reference
+#         if msg_id in hls_processes:
+#             del hls_processes[msg_id]
+#             print(f"🧹 Cleaned up process reference for {msg_id}")
+
+# ============= End HLS Functions =============
+
+# === DIRECT FILE SERVING FUNCTIONS (New Primary Approach) ===
+
+def get_storage_usage() -> int:
+    """Get current storage usage in bytes"""
+    total_size = 0
+    if os.path.exists(DIRECT_FILES_DIR):
+        for filename in os.listdir(DIRECT_FILES_DIR):
+            filepath = os.path.join(DIRECT_FILES_DIR, filename)
+            if os.path.isfile(filepath):
+                total_size += os.path.getsize(filepath)
+    return total_size
+
+def get_files_by_age():
+    """Get list of files sorted by age (oldest first)"""
+    files = []
+    if os.path.exists(DIRECT_FILES_DIR):
+        for filename in os.listdir(DIRECT_FILES_DIR):
+            filepath = os.path.join(DIRECT_FILES_DIR, filename)
+            if os.path.isfile(filepath):
+                mtime = os.path.getmtime(filepath)
+                size = os.path.getsize(filepath)
+                files.append((filepath, mtime, size, filename))
+    
+    # Sort by modification time (oldest first)
+    files.sort(key=lambda x: x[1])
+    return files
+
+async def cleanup_old_files(target_size: int):
+    """Remove old files until storage is under target size"""
+    current_size = get_storage_usage()
+    print(f"🧹 Current storage: {current_size / 1024 / 1024:.1f} MB")
+    
+    if current_size <= target_size:
+        return
+    
+    files_by_age = get_files_by_age()
+    freed_space = 0
+    
+    for filepath, mtime, size, filename in files_by_age:
+        try:
+            os.unlink(filepath)
+            freed_space += size
+            print(f"🗑️ Deleted old file: {filename} ({size / 1024 / 1024:.1f} MB)")
+            
+            # Remove from status tracking
+            msg_id = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+            if msg_id in direct_file_status:
+                del direct_file_status[msg_id]
+            
+            if current_size - freed_space <= target_size:
+                break
+                
+        except Exception as e:
+            print(f"⚠️ Error deleting {filepath}: {e}")
+    
+    new_size = get_storage_usage()
+    print(f"✅ Cleanup complete. Storage: {new_size / 1024 / 1024:.1f} MB (freed {freed_space / 1024 / 1024:.1f} MB)")
+
+async def ensure_storage_space(required_size: int):
+    """Ensure we have enough space for new file"""
+    max_storage_bytes = MAX_STORAGE_MB * 1024 * 1024
+    current_size = get_storage_usage()
+    
+    if current_size + required_size > max_storage_bytes:
+        # Need to free up space
+        target_size = max_storage_bytes - required_size - (100 * 1024 * 1024)  # Leave 100MB buffer
+        await cleanup_old_files(target_size)
+
+def get_direct_file_path(msg_id: str) -> str:
+    """Get file path for a message ID"""
+    if msg_id in direct_file_status and "filepath" in direct_file_status[msg_id]:
+        filepath = direct_file_status[msg_id]["filepath"]
+        if os.path.exists(filepath):
+            return filepath
+    
+    # Check if file exists with pattern
+    if os.path.exists(DIRECT_FILES_DIR):
+        for filename in os.listdir(DIRECT_FILES_DIR):
+            if filename.startswith(f"{msg_id}_"):
+                return os.path.join(DIRECT_FILES_DIR, filename)
+    
+    return None
+
+async def download_direct_file(msg_id: str):
+    """Download file from Telegram for direct serving"""
+    global client, direct_file_status
+    
+    try:
+        print(f"📁 Starting direct download for msg_id: {msg_id}")
+        
+        # Check if file already exists
+        existing_path = get_direct_file_path(msg_id)
+        if existing_path:
+            print(f"✅ File already downloaded: {existing_path}")
+            return True
+        
+        # Set initial status
+        direct_file_status[msg_id] = {
+            "status": "initializing",
+            "progress": 0
+        }
+        
+        # Load video data to find the episode
+        data = await load_video_data()
+        episode_info = None
+        
+        for series_name, series_data in data.items():
+            for season_name, episodes in series_data.items():
+                for episode in episodes:
+                    _, ep_msg_id = parse_telegram_url(episode["url"])
+                    if ep_msg_id == int(msg_id):
+                        episode_info = {
+                            "url": episode["url"],
+                            "title": episode.get("title", f"Episode {msg_id}"),
+                            "series": series_name,
+                            "season": season_name
+                        }
+                        break
+                if episode_info:
+                    break
+            if episode_info:
+                break
+        
+        if not episode_info:
+            print(f"❌ Episode with msg_id {msg_id} not found")
+            direct_file_status[msg_id] = {"status": "error", "error": "Episode not found"}
+            return False
+        
+        # Get Telegram message
+        channel, telegram_msg_id = parse_telegram_url(episode_info["url"])
+        message = await client.get_messages(channel, ids=telegram_msg_id)
+        
+        if not message or not message.document:
+            print(f"❌ Message or document not found for {msg_id}")
+            direct_file_status[msg_id] = {"status": "error", "error": "Message not found"}
+            return False
+        
+        # Get file info
+        total_size = message.document.size
+        
+        # Extract filename
+        filename = f"{msg_id}.mkv"
+        if message.document.attributes:
+            for attr in message.document.attributes:
+                if hasattr(attr, 'file_name') and attr.file_name:
+                    filename = attr.file_name
+                    break
+        
+        print(f"📁 Direct download: {filename} ({total_size / 1024 / 1024:.1f} MB)")
+        
+        # Ensure storage space
+        await ensure_storage_space(total_size)
+        
+        # Set downloading status
+        direct_file_status[msg_id] = {
+            "status": "downloading",
+            "progress": 0,
+            "total_size": total_size,
+            "filename": filename
+        }
+        
+        # Download file
+        filepath = os.path.join(DIRECT_FILES_DIR, f"{msg_id}_{filename}")
+        
+        def progress_callback(current, total):
+            progress = (current / total) * 100
+            direct_file_status[msg_id]["progress"] = progress
+            if int(progress) % 10 == 0:  # Log every 10%
+                print(f"📊 Direct download: {current / 1024 / 1024:.1f} MB / {total / 1024 / 1024:.1f} MB ({progress:.1f}%)")
+        
+        # Download the file
+        await client.download_media(
+            message,
+            file=filepath,
+            progress_callback=progress_callback
+        )
+        
+        # Update status
+        direct_file_status[msg_id] = {
+            "status": "ready",
+            "progress": 100,
+            "filepath": filepath,
+            "filename": filename,
+            "size": total_size,
+            "download_url": f"/direct/{msg_id}"
+        }
+        
+        print(f"✅ Direct download completed: {filepath}")
+        return True
+        
+    except Exception as e:
+        error_msg = f"Direct download error: {str(e)}"
+        print(f"❌ {error_msg}")
+        import traceback
+        print(f"❌ Traceback: {traceback.format_exc()}")
+        direct_file_status[msg_id] = {"status": "error", "error": error_msg}
+        return False
+
+def get_mime_type(filename: str) -> str:
+    """Get MIME type for video file"""
+    import mimetypes
+    mime_type, _ = mimetypes.guess_type(filename)
+    if mime_type:
+        return mime_type
+    
+    # Default MIME types for common video formats
+    ext = filename.lower().split('.')[-1] if '.' in filename else ''
+    video_types = {
+        'mkv': 'video/x-matroska',
+        'mp4': 'video/mp4',
+        'avi': 'video/x-msvideo',
+        'mov': 'video/quicktime',
+        'wmv': 'video/x-ms-wmv',
+        'flv': 'video/x-flv',
+        'webm': 'video/webm',
+        'm4v': 'video/mp4'
+    }
+    
+    return video_types.get(ext, 'video/x-matroska')
+
+# ============= End Direct Serving Functions =============
 
 # Catalog routes
 @app.get("/catalog/series")
@@ -261,9 +1059,6 @@ async def list_episodes(series_name: str, season_name: str):
     if expired_files:
         for msg_id in expired_files:
             if msg_id in uploaded_files:
-                file_info = uploaded_files[msg_id]
-                # Delete from PixelDrain
-                await delete_from_pixeldrain(file_info.get("pixeldrain_id"))
                 # Remove from database
                 del uploaded_files[msg_id]
         await save_uploaded_files_db_async(uploaded_files)
@@ -274,35 +1069,54 @@ async def list_episodes(series_name: str, season_name: str):
 # Download and upload to PixelDrain
 @app.get("/download")
 async def trigger_download(url: str):
-    """Queue a single episode download (HIGH priority)"""
+    """Download a single episode using direct file system"""
     try:
-        # Use the new queue-based download system
-        result = await download_scheduler.queue_single_episode_download(url, client)
+        # Parse the Telegram URL to get msg_id
+        channel, msg_id = parse_telegram_url(url)
+        if not msg_id:
+            raise HTTPException(400, "Invalid Telegram URL")
         
-        if result["status"] == "already_uploaded":
+        msg_id_str = str(msg_id)
+        
+        # Check if already exists
+        existing_path = get_direct_file_path(msg_id_str)
+        if existing_path:
             return {
                 "status": "already_uploaded",
-                "pixeldrain_id": result["pixeldrain_id"],
-                "msg_id": result["msg_id"]
+                "msg_id": msg_id_str,
+                "message": "File already available for streaming"
             }
-        elif result["status"] == "queued":
+        
+        # Check if download is already in progress
+        if msg_id_str in direct_file_status:
+            status = direct_file_status[msg_id_str]["status"]
+            if status == "downloading":
+                return {
+                    "status": "already_queued",
+                    "msg_id": msg_id_str,
+                    "message": "Download already in progress"
+                }
+            elif status == "ready":
+                return {
+                    "status": "already_uploaded",
+                    "msg_id": msg_id_str,
+                    "message": "File ready for streaming"
+                }
+        
+        # Start the download
+        success = await download_direct_file(msg_id_str)
+        
+        if success:
             return {
-                "status": "queued", 
-                "msg_id": result["msg_id"],
-                "priority": result["priority"],
-                "queue_position": result["queue_position"],
-                "message": f"Added to {result['priority']} priority queue (position: {result['queue_position']})"
-            }
-        elif result["status"] == "already_queued":
-            return {
-                "status": "already_queued",
-                "msg_id": result["msg_id"],
-                "message": "Download already in progress or queued"
+                "status": "queued",
+                "msg_id": msg_id_str,
+                "message": "Download started successfully"
             }
         else:
             return {
                 "status": "error",
-                "message": "Failed to queue download"
+                "msg_id": msg_id_str,
+                "message": "Failed to start download"
             }
             
     except ValueError as e:
@@ -311,170 +1125,141 @@ async def trigger_download(url: str):
         print(f"❌ Error in trigger_download: {e}")
         raise HTTPException(500, f"Download failed: {str(e)}")
 
-@app.get("/downloads")
-async def list_downloads():
-    uploaded_files = await load_uploaded_files_db_async()
-    files = []
-    
-    for msg_id, file_info in uploaded_files.items():
-        if "pixeldrain_id" in file_info:
-            # PixelDrain format
-            files.append({
-                "msg_id": msg_id,
-                "pixeldrain_id": file_info["pixeldrain_id"],
-                "filename": file_info["filename"],
-                "storage": "pixeldrain",
-                "access_count": file_info.get("access_count", 0),
-                "remaining_access": MAX_ACCESS_COUNT - file_info.get("access_count", 0)
-            })
-        else:
-            # Unknown format
-            files.append({
-                "msg_id": msg_id,
-                "filename": file_info.get("filename", f"{msg_id}.mkv"),
-                "storage": "unknown",
-                "note": "Unknown format, re-download recommended"
-            })
-    
-    return files
-
-@app.get("/test/chunked_upload")
-async def test_chunked_upload(size_mb: int = 100):
-    """Test memory-safe chunked upload without Telegram (for testing memory usage)"""
-    import tempfile
-    
-    if size_mb > 500:  # Prevent excessive test files
-        raise HTTPException(400, "Test file size too large (max 500MB)")
-    
-    print(f"🧪 Testing memory-safe upload with {size_mb}MB file...")
-    test_file_path = None
-    
+@app.get("/download/real_progress/{msg_id}")
+async def get_real_download_progress(msg_id: str):
+    """Get accurate download progress for direct file downloads"""
     try:
-        # Create test file
-        temp_dir = tempfile.gettempdir()
-        test_file_path = os.path.join(temp_dir, f"test_upload_{size_mb}MB.dat")
+        # Check direct file status
+        if msg_id in direct_file_status:
+            status = direct_file_status[msg_id]
+            
+            if status["status"] == "downloading":
+                return {
+                    "status": "downloading",
+                    "msg_id": msg_id,
+                    "downloading": True,
+                    "temp_file_found": True,
+                    "downloaded_size": status.get("downloaded_size", 0),
+                    "total_size": status.get("total_size", 0),
+                    "percentage": status.get("progress", 0),
+                    "filename": status.get("filename", f"{msg_id}.mkv")
+                }
+            elif status["status"] == "ready":
+                return {
+                    "status": "not_downloading",
+                    "msg_id": msg_id,
+                    "downloading": False,
+                    "completed": True,
+                    "filename": status.get("filename", f"{msg_id}.mkv")
+                }
+            elif status["status"] == "error":
+                return {
+                    "status": "error",
+                    "msg_id": msg_id,
+                    "downloading": False,
+                    "error": status.get("error", "Unknown error")
+                }
         
-        # Create file in chunks to avoid memory issues
-        chunk_size = 1024 * 1024  # 1MB
-        print(f"📝 Creating {size_mb}MB test file...")
-        
-        with open(test_file_path, 'wb') as f:
-            for i in range(size_mb):
-                chunk = b'T' * chunk_size  # Fill with 'T' character
-                f.write(chunk)
-                if (i + 1) % 10 == 0:  # Print every 10MB
-                    print(f"📦 Created {i+1}/{size_mb}MB")
-        
-        print(f"✅ Test file created: {os.path.getsize(test_file_path) / (1024*1024):.1f}MB")
-        
-        # Test memory-safe upload
-        start_time = time.time()
-        result = await upload_to_pixeldrain(test_file_path, f"test_{size_mb}MB.dat")
-        upload_time = time.time() - start_time
-        
+        # Not found in direct file status
         return {
-            "status": "success",
-            "pixeldrain_id": result,
-            "file_size_mb": size_mb,
-            "upload_time_seconds": round(upload_time, 2),
-            "upload_speed_mbps": round(size_mb / upload_time, 2),
-            "message": f"Successfully uploaded {size_mb}MB test file in {upload_time:.2f}s using memory-safe method",
-            "memory_info": "Upload used ~8-16MB memory regardless of file size"
+            "status": "not_downloading",
+            "msg_id": msg_id,
+            "downloading": False,
+            "temp_file_found": False,
+            "downloaded_size": 0,
+            "total_size": 0,
+            "percentage": 0
         }
         
     except Exception as e:
-        print(f"❌ Test upload failed: {e}")
+        print(f"❌ Error getting download progress for {msg_id}: {e}")
+        return {
+            "status": "error",
+            "msg_id": msg_id,
+            "error": str(e),
+            "downloading": False
+        }
+
+@app.get("/test/hls_conversion")
+async def test_direct_streaming(msg_id: str = "3899"):
+    """Test direct streaming with Telegram download"""
+    
+    print(f"🧪 Testing direct streaming for episode {msg_id}")
+    
+    try:
+        # Start download in background
+        await download_direct_file(msg_id)
+        
+        return {
+            "status": "success",
+            "message": f"Direct download started for episode {msg_id}",
+            "stream_url": f"/direct/{msg_id}",
+            "status_url": f"/direct/status/{msg_id}"
+        }
+        
+    except Exception as e:
+        print(f"❌ Direct streaming test failed: {e}")
         return {
             "status": "error",
             "error": str(e),
-            "message": f"Memory-safe upload test failed for {size_mb}MB file"
+            "message": "Direct streaming test failed"
         }
-    
-    finally:
-        # Clean up test file
-        if test_file_path and os.path.exists(test_file_path):
-            try:
-                os.unlink(test_file_path)
-                print(f"🧹 Cleaned up test file")
-            except:
-                pass
-
-@app.get("/queue/status")
-async def get_queue_status():
-    """Get current download queue status"""
-    return download_scheduler.get_download_status()
 
 @app.get("/stream_local/{msg_id}")
-async def stream_local(msg_id: str, request: Request):
-    # Get file URL from database
-    uploaded_files = await load_uploaded_files_db_async()
+async def stream_local(msg_id: str, request: Request, quality: str = Query("720p", description="Video quality (unused for direct streaming)")):
+    """Stream video using direct file serving for Smart TV compatibility"""
+    print(f"📺 Direct streaming request for msg_id: {msg_id}")
     
-    if str(msg_id) not in uploaded_files:
-        raise HTTPException(404, "File not uploaded yet")
-    
-    file_info = uploaded_files[str(msg_id)]
-    filename = file_info.get("filename", f"{msg_id}.mkv")
-    pixeldrain_id = file_info["pixeldrain_id"]
-    
-    # Verify file still exists on PixelDrain
-    if not await check_pixeldrain_file_exists(pixeldrain_id):
-        # File expired or deleted, remove from database
-        del uploaded_files[str(msg_id)]
-        await save_uploaded_files_db_async(uploaded_files)
-        raise HTTPException(404, "File expired or deleted from PixelDrain")
-    
-    # Check access count
-    access_count = file_info.get("access_count", 0)
-    if access_count >= MAX_ACCESS_COUNT:
-        # File exceeded access limit
-        await delete_from_pixeldrain(pixeldrain_id)
-        del uploaded_files[str(msg_id)]
-        await save_uploaded_files_db_async(uploaded_files)
-        raise HTTPException(410, f"File access limit exceeded ({MAX_ACCESS_COUNT} times). File has been deleted.")
-    
-    # Increment access count
-    file_info["access_count"] = access_count + 1
-    uploaded_files[str(msg_id)] = file_info
-    await save_uploaded_files_db_async(uploaded_files)
-    
-    print(f"📺 Redirecting to PixelDrain direct URL: {filename} (access {access_count + 1}/{MAX_ACCESS_COUNT})")
-    
-    # Get PixelDrain direct URL
-    pixeldrain_url = get_pixeldrain_download_url(pixeldrain_id)
-    
-    # For Smart TVs, redirect to the direct PixelDrain URL
-    # PixelDrain handles range requests natively
+    # Redirect to direct streaming endpoint
     from fastapi.responses import RedirectResponse
-    return RedirectResponse(url=pixeldrain_url, status_code=302)
+    return RedirectResponse(url=f"/direct/{msg_id}", status_code=302)
 
 @app.head("/stream_local/{msg_id}")
 async def stream_local_head(msg_id: str):
-    # Get file URL from database
-    uploaded_files = load_uploaded_files_db()
+    """Head request for streaming endpoint"""
+    # Check if file exists or can be downloaded
+    filepath = get_direct_file_path(msg_id)
     
-    if str(msg_id) not in uploaded_files:
-        raise HTTPException(404, "File not uploaded yet")
+    if not filepath:
+        # Try to check if file can be downloaded
+        if msg_id in direct_file_status:
+            status = direct_file_status[msg_id]["status"]
+            if status == "ready":
+                filepath = direct_file_status[msg_id].get("filepath")
+            elif status in ["downloading", "initializing"]:
+                # File is being prepared
+                response_headers = {
+                    'Content-Type': 'video/x-matroska',
+                    'Accept-Ranges': 'bytes',
+                    'Cache-Control': 'no-cache'
+                }
+                return JSONResponse(content={}, status_code=202, headers=response_headers)
+            else:
+                raise HTTPException(status_code=404, detail="File not found")
+        else:
+            raise HTTPException(status_code=404, detail="File not found")
     
-    file_info = uploaded_files[str(msg_id)]
-    pixeldrain_id = file_info["pixeldrain_id"]
-    
-    # Verify file still exists
-    if not await check_pixeldrain_file_exists(pixeldrain_id):
-        raise HTTPException(404, "File not found on PixelDrain")
-    
-    # Check access count
-    access_count = file_info.get("access_count", 0)
-    if access_count >= MAX_ACCESS_COUNT:
-        raise HTTPException(410, f"File access limit exceeded ({MAX_ACCESS_COUNT} times)")
-    
-    # Return basic headers for video content
-    response_headers = {
-        'Accept-Ranges': 'bytes',
-        'Content-Type': 'video/mp4',
-        'Cache-Control': 'no-cache'
-    }
-    
-    return JSONResponse(content={}, headers=response_headers)
+    # File exists, return appropriate headers
+    if filepath and os.path.exists(filepath):
+        file_size = os.path.getsize(filepath)
+        filename = os.path.basename(filepath)
+        
+        response_headers = {
+            'Content-Length': str(file_size),
+            'Content-Type': get_mime_type(filename),
+            'Accept-Ranges': 'bytes',
+            'Cache-Control': 'public, max-age=3600'
+        }
+        return JSONResponse(content={}, headers=response_headers)
+    else:
+        raise HTTPException(status_code=404, detail="File not found")
+
+@app.get("/stream_status/{msg_id}")
+async def get_stream_status(msg_id: str):
+    """Get the status of direct file streaming for a video"""
+    # Redirect to direct streaming status endpoint
+    from fastapi.responses import RedirectResponse
+    return RedirectResponse(url=f"/direct/status/{msg_id}", status_code=302)
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
@@ -491,43 +1276,23 @@ async def global_exception_handler(request, exc):
 
 # File expiration and cleanup functions
 async def cleanup_expired_files():
-    """Check all uploaded files and remove expired ones from database"""
-    uploaded_files = await load_uploaded_files_db_async()
-    expired_files = []
+    """Clean up old direct files and outdated database entries"""
+    print("🧹 Starting cleanup of old direct files...")
     
-    print("🧹 Starting proactive cleanup of expired files...")
-    
-    for msg_id, file_info in uploaded_files.items():
-        filename = file_info.get("filename", f"{msg_id}.mkv")
+    try:
+        # Clean up old direct files to maintain storage limits
+        current_usage = get_storage_usage()
+        max_usage = MAX_STORAGE_MB * 1024 * 1024 * 0.8  # Clean when 80% full
         
-        # Check if file is PixelDrain format
-        if "pixeldrain_id" in file_info:
-            pixeldrain_id = file_info["pixeldrain_id"]
-            access_count = file_info.get("access_count", 0)
-            
-            # Check if file has exceeded access limit
-            if access_count >= MAX_ACCESS_COUNT:
-                expired_files.append(msg_id)
-                print(f"🗑️ Found expired file (access limit reached): {filename} ({access_count}/{MAX_ACCESS_COUNT} accesses)")
-                # Delete from PixelDrain
-                await delete_from_pixeldrain(pixeldrain_id)
-            else:
-                # Check if file still exists on PixelDrain
-                if not await check_pixeldrain_file_exists(pixeldrain_id):
-                    expired_files.append(msg_id)
-                    print(f"🗑️ Found expired file (not found on PixelDrain): {filename}")
-        else:
-            # Unknown format - mark for removal
-            expired_files.append(msg_id)
-            print(f"🗑️ Found unknown format file: {filename}")
-    
-    # Remove expired files from database
-    if expired_files:
-        for msg_id in expired_files:
-            del uploaded_files[msg_id]
-
-        await save_uploaded_files_db_async(uploaded_files)
-        print(f"✅ Cleaned up {len(expired_files)} expired files from database")
+        if current_usage > max_usage:
+            await cleanup_old_files(int(max_usage * 0.6))  # Clean to 60% of max
+        
+        print("✅ Direct file cleanup completed")
+        return 0
+        
+    except Exception as e:
+        print(f"❌ Error in cleanup: {e}")
+        return 0
     else:
         print("✅ No expired files found")
     
@@ -555,321 +1320,6 @@ async def manual_cleanup():
         }
     except Exception as e:
         raise HTTPException(500, f"Cleanup failed: {str(e)}")
-
-@app.get("/download/progress/{msg_id}")
-async def get_download_progress(msg_id: str):
-    """Get real download progress from temp directory"""
-    try:
-        # Check if download is in progress using QUEUE MANAGER
-        msg_id_int = int(msg_id)
-        download_in_progress = queue_manager.is_download_in_progress(msg_id_int)
-        
-        print(f"🔍 Checking download progress for msg_id: {msg_id}")
-        print(f"📋 Queue manager download tasks: {list(queue_manager.download_tasks.keys())}")
-        print(f"✅ Download in progress (queue manager): {download_in_progress}")
-        
-        if not download_in_progress:
-            return {
-                "status": "not_downloading",
-                "msg_id": msg_id,
-                "downloading": False
-            }
-        
-        # Look for temp file in temp directory
-        temp_files = []
-        
-        # Check custom temp directory if specified
-        if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
-            temp_dir = CUSTOM_TEMP_DIR
-        else:
-            temp_dir = tempfile.gettempdir()
-        
-        # Look for files with our message ID pattern
-        for filename in os.listdir(temp_dir):
-            if f"temp_{msg_id}" in filename or str(msg_id) in filename:
-                temp_file_path = os.path.join(temp_dir, filename)
-                if os.path.isfile(temp_file_path):
-                    temp_files.append({
-                        "filename": filename,
-                        "path": temp_file_path,
-                        "size": os.path.getsize(temp_file_path),
-                        "modified": os.path.getmtime(temp_file_path)
-                    })
-        
-        if not temp_files:
-            return {
-                "status": "downloading",
-                "msg_id": msg_id,
-                "downloading": True,
-                "temp_file_found": False,
-                "downloaded_size": 0,
-                "total_size": 0,
-                "percentage": 0
-            }
-        
-        # Get the most recent temp file (in case of multiple matches)
-        latest_temp = max(temp_files, key=lambda x: x["modified"])
-        downloaded_size = latest_temp["size"]
-        
-        # Try to get total size from Telegram message
-        total_size = 0
-        try:
-            if client and client.is_connected():
-                channel, msg_id_int = parse_telegram_url(f"https://t.me/c/1/{msg_id}")  # Dummy URL to get msg_id
-                if msg_id_int:
-                    # We need to find the actual channel - this is a limitation
-                    # For now, we'll estimate or use a default
-                    pass
-        except:
-            pass
-        
-        # If we can't get total size, estimate based on typical file sizes
-        if total_size == 0:
-            # Estimate based on downloaded size and time elapsed
-            if downloaded_size > 50 * 1024 * 1024:  # If > 50MB downloaded
-                total_size = downloaded_size * 2  # Conservative estimate
-            else:
-                total_size = 150 * 1024 * 1024  # Default 150MB estimate
-        
-        percentage = (downloaded_size / total_size * 100) if total_size > 0 else 0
-        percentage = min(percentage, 95)  # Cap at 95% until confirmed complete
-        
-        return {
-            "status": "downloading",
-            "msg_id": msg_id,
-            "downloading": True,
-            "temp_file_found": True,
-            "temp_filename": latest_temp["filename"],
-            "downloaded_size": downloaded_size,
-            "total_size": total_size,
-            "percentage": percentage,
-            "download_speed_estimate": "calculating..."
-        }
-        
-    except Exception as e:
-        print(f"❌ Error getting download progress for {msg_id}: {e}")
-        return {
-            "status": "error",
-            "msg_id": msg_id,
-            "error": str(e),
-            "downloading": False
-        }
-
-@app.get("/download/file_info/{msg_id}")
-async def get_file_info(msg_id: str):
-    """Get file information from Telegram message"""
-    try:
-        if not client or not client.is_connected():
-            await client.connect()
-        
-        # Load video data to find the channel for this message
-        with open("cache/video.json", encoding="utf-8") as f:
-            data = json.load(f)
-        
-        # Find the episode with this msg_id
-        episode_info = None
-        for series_name, series_data in data.items():
-            for season_name, episodes in series_data.items():
-                for episode in episodes:
-                    channel, ep_msg_id = parse_telegram_url(episode["url"])
-                    if ep_msg_id == int(msg_id):
-                        episode_info = {
-                            "channel": channel,
-                            "msg_id": ep_msg_id,
-                            "title": episode["title"],
-                            "url": episode["url"],
-                            "series": series_name,
-                            "season": season_name
-                        }
-                        break
-                if episode_info:
-                    break
-            if episode_info:
-                break
-        
-        if not episode_info:
-            return {
-                "status": "not_found",
-                "msg_id": msg_id,
-                "note": "Episode not found in catalog"
-            }
-        
-        # Get message from Telegram
-        message = await client.get_messages(episode_info["channel"], ids=episode_info["msg_id"])
-        if not message:
-            return {
-                "status": "no_message",
-                "msg_id": msg_id,
-                "note": "Message not found"
-            }
-        
-        # Check if it's a video or document
-        if message.video:
-            # It's a video message
-            file_size = message.video.size
-            duration = getattr(message.video, 'duration', None)
-            filename = None
-            
-            # Try to get original filename
-            if message.video.attributes:
-                for attr in message.video.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        filename = attr.file_name
-                        break
-        elif message.document:
-            # It's a document (video file sent as document)
-            file_size = message.document.size
-            duration = None  # Documents don't have duration attribute
-            filename = None
-            
-            # Try to get original filename from document attributes
-            if message.document.attributes:
-                for attr in message.document.attributes:
-                    if hasattr(attr, 'file_name') and attr.file_name:
-                        filename = attr.file_name
-                        break
-                    # Check for video attributes in document
-                    if hasattr(attr, 'duration'):
-                        duration = attr.duration
-        else:
-            return {
-                "status": "no_video",
-                "msg_id": msg_id,
-                "note": "No video or document found in message"
-            }
-        
-        if not filename:
-            filename = f"{msg_id}.mkv"
-        
-        return {
-            "status": "found",
-            "msg_id": msg_id,
-            "file_size": file_size,
-            "file_size_mb": file_size / (1024 * 1024),
-            "duration": duration,
-            "filename": filename,
-            "title": episode_info["title"],
-            "series": episode_info["series"],
-            "season": episode_info["season"]
-        }
-        
-    except Exception as e:
-        print(f"❌ Error getting file info for {msg_id}: {e}")
-        return {
-            "status": "error",
-            "msg_id": msg_id,
-            "error": str(e)
-        }
-
-@app.get("/download/real_progress/{msg_id}")
-async def get_real_download_progress(msg_id: str):
-    """Get accurate download progress by checking temp file size vs actual file size"""
-    try:
-        # First get the actual file size from Telegram
-        file_info_response = await get_file_info(msg_id)
-        
-        if file_info_response["status"] != "found":
-            return {
-                "status": "file_info_unavailable",
-                "msg_id": msg_id,
-                "error": "Cannot get file size from Telegram"
-            }
-        
-        actual_total_size = file_info_response["file_size"]
-        filename = file_info_response["filename"]
-        
-        # Check if download is in progress using QUEUE MANAGER (not global variable)
-        msg_id_int = int(msg_id)
-        download_in_progress = queue_manager.is_download_in_progress(msg_id_int)
-        
-        print(f"🔍 Checking download progress for msg_id: {msg_id}")
-        print(f"📋 Queue manager download tasks: {list(queue_manager.download_tasks.keys())}")
-        print(f"✅ Download in progress (queue manager): {download_in_progress}")
-        
-        if not download_in_progress:
-            return {
-                "status": "not_downloading",
-                "msg_id": msg_id,
-                "downloading": False,
-                "total_size": actual_total_size,
-                "filename": filename
-            }
-        
-        # Look for temp file in temp directory
-        temp_files = []
-        
-        # Check custom temp directory if specified
-        if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
-            temp_dir = CUSTOM_TEMP_DIR
-        else:
-            temp_dir = tempfile.gettempdir()
-        
-        print(f"📁 Checking temp directory: {temp_dir}")
-        
-        # Look for files with our message ID pattern
-        try:
-            for temp_filename in os.listdir(temp_dir):
-                if f"temp_{msg_id}" in temp_filename or str(msg_id) in temp_filename:
-                    temp_file_path = os.path.join(temp_dir, temp_filename)
-                    if os.path.isfile(temp_file_path):
-                        file_size = os.path.getsize(temp_file_path)
-                        temp_files.append({
-                            "filename": temp_filename,
-                            "path": temp_file_path,
-                            "size": file_size,
-                            "modified": os.path.getmtime(temp_file_path)
-                        })
-                        print(f"📄 Found temp file: {temp_filename} ({file_size / (1024*1024):.1f} MB)")
-        except Exception as e:
-            print(f"❌ Error listing temp directory: {e}")
-        
-        if not temp_files:
-            print(f"⚠️ No temp files found for msg_id: {msg_id}")
-            return {
-                "status": "downloading",
-                "msg_id": msg_id,
-                "downloading": True,
-                "temp_file_found": False,
-                "downloaded_size": 0,
-                "total_size": actual_total_size,
-                "percentage": 0,
-                "filename": filename,
-                "temp_directory": temp_dir
-            }
-        
-        # Get the most recent temp file
-        latest_temp = max(temp_files, key=lambda x: x["modified"])
-        downloaded_size = latest_temp["size"]
-        
-        # Calculate accurate percentage
-        percentage = (downloaded_size / actual_total_size * 100) if actual_total_size > 0 else 0
-        percentage = min(percentage, 99.9)  # Cap at 99.9% until confirmed complete
-        
-        print(f"📊 Progress: {downloaded_size / (1024*1024):.1f}MB / {actual_total_size / (1024*1024):.1f}MB ({percentage:.1f}%)")
-        
-        return {
-            "status": "downloading",
-            "msg_id": msg_id,
-            "downloading": True,
-            "temp_file_found": True,
-            "temp_filename": latest_temp["filename"],
-            "downloaded_size": downloaded_size,
-            "total_size": actual_total_size,
-            "percentage": percentage,
-            "filename": filename,
-            "temp_directory": temp_dir
-        }
-        
-    except Exception as e:
-        print(f"❌ Error getting real download progress for {msg_id}: {e}")
-        import traceback
-        print(f"🔍 Full traceback: {traceback.format_exc()}")
-        return {
-            "status": "error",
-            "msg_id": msg_id,
-            "error": str(e),
-            "downloading": False
-        }
 
 @app.get("/temp/files")
 async def list_temp_files():
@@ -933,11 +1383,200 @@ async def health_check():
         "status": "healthy",
         "service": "Smart TV Streaming Server",
         "telegram_status": telegram_status,
-        "pixeldrain_configured": bool(PIXELDRAIN_API_KEY),
+        "direct_streaming_enabled": True,
         "telegram_configured": bool(API_ID and API_HASH),
         "session_type": "StringSession" if TELEGRAM_SESSION_STRING else "FileSession",
-        "max_access_count": MAX_ACCESS_COUNT
+        "storage_limit_mb": MAX_STORAGE_MB
     }
+
+# === DIRECT FILE SERVING ENDPOINTS (New Primary Approach) ===
+
+@app.get("/direct/{msg_id}")
+async def direct_file_stream(msg_id: str, request: Request):
+    """Direct file streaming endpoint with range support"""
+    try:
+        # Get file path
+        filepath = get_direct_file_path(msg_id)
+        
+        if not filepath:
+            # Try to download if not available
+            print(f"📁 File not found locally, attempting download for {msg_id}")
+            success = await download_direct_file(msg_id)
+            if not success:
+                raise HTTPException(status_code=404, detail="File not found or download failed")
+            
+            filepath = get_direct_file_path(msg_id)
+            if not filepath:
+                raise HTTPException(status_code=404, detail="Download failed")
+        
+        # Get file info
+        file_size = os.path.getsize(filepath)
+        filename = os.path.basename(filepath)
+        
+        # Handle range requests for video seeking
+        range_header = request.headers.get('Range')
+        
+        if range_header:
+            # Parse range header
+            range_match = range_header.replace('bytes=', '').split('-')
+            start = int(range_match[0]) if range_match[0] else 0
+            end = int(range_match[1]) if range_match[1] else file_size - 1
+            
+            # Ensure valid range
+            if start >= file_size:
+                raise HTTPException(status_code=416, detail="Range not satisfiable")
+            
+            end = min(end, file_size - 1)
+            chunk_size = end - start + 1
+            
+            def file_reader():
+                with open(filepath, 'rb') as f:
+                    f.seek(start)
+                    data = f.read(chunk_size)
+                    yield data
+            
+            headers = {
+                'Content-Range': f'bytes {start}-{end}/{file_size}',
+                'Accept-Ranges': 'bytes',
+                'Content-Length': str(chunk_size),
+                'Content-Type': get_mime_type(filename)
+            }
+            
+            return StreamingResponse(
+                file_reader(),
+                status_code=206,
+                headers=headers
+            )
+        else:
+            # Full file streaming
+            def file_reader():
+                with open(filepath, 'rb') as f:
+                    while True:
+                        chunk = f.read(8192)  # 8KB chunks
+                        if not chunk:
+                            break
+                        yield chunk
+            
+            headers = {
+                'Content-Length': str(file_size),
+                'Content-Type': get_mime_type(filename),
+                'Accept-Ranges': 'bytes'
+            }
+            
+            return StreamingResponse(
+                file_reader(),
+                headers=headers
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error serving direct file {msg_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Server error: {str(e)}")
+
+@app.get("/direct/status/{msg_id}")
+async def get_direct_file_status(msg_id: str):
+    """Get status of direct file download/serving"""
+    if msg_id in direct_file_status:
+        status = direct_file_status[msg_id].copy()
+        
+        # Add storage info
+        status["storage"] = {
+            "used_mb": round(get_storage_usage() / 1024 / 1024, 1),
+            "max_mb": MAX_STORAGE_MB,
+            "available_mb": round((MAX_STORAGE_MB * 1024 * 1024 - get_storage_usage()) / 1024 / 1024, 1)
+        }
+        
+        return status
+    else:
+        return {"status": "not_found", "error": "File not requested yet"}
+
+@app.post("/direct/download/{msg_id}")
+async def start_direct_download(msg_id: str, background_tasks: BackgroundTasks):
+    """Start direct file download"""
+    try:
+        # Check if already downloading or ready
+        if msg_id in direct_file_status:
+            status = direct_file_status[msg_id]["status"]
+            if status in ["downloading", "ready"]:
+                return {"status": "already_exists", "current_status": status}
+        
+        # Start download in background
+        background_tasks.add_task(download_direct_file, msg_id)
+        
+        return {
+            "status": "download_started",
+            "msg_id": msg_id,
+            "message": "Download started in background"
+        }
+        
+    except Exception as e:
+        print(f"❌ Error starting direct download for {msg_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to start download: {str(e)}")
+
+@app.get("/direct/storage/info")
+async def direct_storage_info():
+    """Get storage information for direct files"""
+    total_usage = get_storage_usage()
+    files_info = []
+    
+    if os.path.exists(DIRECT_FILES_DIR):
+        for filename in os.listdir(DIRECT_FILES_DIR):
+            filepath = os.path.join(DIRECT_FILES_DIR, filename)
+            if os.path.isfile(filepath):
+                size = os.path.getsize(filepath)
+                mtime = os.path.getmtime(filepath)
+                msg_id = filename.split('_')[0] if '_' in filename else filename.split('.')[0]
+                
+                files_info.append({
+                    "filename": filename,
+                    "msg_id": msg_id,
+                    "size_mb": round(size / 1024 / 1024, 1),
+                    "modified": mtime,
+                    "url": f"/direct/{msg_id}"
+                })
+    
+    # Sort by modification time (newest first)
+    files_info.sort(key=lambda x: x["modified"], reverse=True)
+    
+    return {
+        "storage": {
+            "used_mb": round(total_usage / 1024 / 1024, 1),
+            "max_mb": MAX_STORAGE_MB,
+            "available_mb": round((MAX_STORAGE_MB * 1024 * 1024 - total_usage) / 1024 / 1024, 1),
+            "usage_percent": round((total_usage / (MAX_STORAGE_MB * 1024 * 1024)) * 100, 1)
+        },
+        "files": files_info,
+        "files_count": len(files_info)
+    }
+
+@app.delete("/direct/cleanup")
+async def cleanup_direct_storage():
+    """Clean up old files to free storage space"""
+    try:
+        initial_usage = get_storage_usage()
+        target_size = int(MAX_STORAGE_MB * 0.5 * 1024 * 1024)  # Clean to 50% of max
+        
+        await cleanup_old_files(target_size)
+        
+        final_usage = get_storage_usage()
+        freed_mb = round((initial_usage - final_usage) / 1024 / 1024, 1)
+        
+        return {
+            "status": "cleanup_completed",
+            "freed_mb": freed_mb,
+            "storage": {
+                "before_mb": round(initial_usage / 1024 / 1024, 1),
+                "after_mb": round(final_usage / 1024 / 1024, 1),
+                "max_mb": MAX_STORAGE_MB
+            }
+        }
+        
+    except Exception as e:
+        print(f"❌ Error during cleanup: {e}")
+        raise HTTPException(status_code=500, detail=f"Cleanup failed: {str(e)}")
+
+# === END DIRECT SERVING ENDPOINTS ===
 
 # Add info endpoint
 @app.get("/")
@@ -974,42 +1613,12 @@ async def root():
                 "trigger_download": {
                     "path": "/download?url={telegram_url}",
                     "method": "GET",
-                    "description": "Queue a single episode download (HIGH priority)"
-                },
-                "list_downloads": {
-                    "path": "/downloads",
-                    "method": "GET",
-                    "description": "List all downloaded files"
-                },
-                "season_download": {
-                    "path": "/download/season?series_name={series_name}&season_name={season_name}",
-                    "method": "POST",
-                    "description": "Download all episodes from a season"
-                },
-                "season_status": {
-                    "path": "/download/season/status",
-                    "method": "GET",
-                    "description": "Get status of all season downloads"
-                },
-                "cancel_season": {
-                    "path": "/download/season/{season_id}",
-                    "method": "DELETE",
-                    "description": "Cancel a season download"
-                },
-                "download_progress": {
-                    "path": "/download/progress/{msg_id}",
-                    "method": "GET",
-                    "description": "Get basic download progress"
+                    "description": "Download a single episode using direct file system"
                 },
                 "real_progress": {
                     "path": "/download/real_progress/{msg_id}",
                     "method": "GET",
-                    "description": "Get accurate download progress with file size"
-                },
-                "file_info": {
-                    "path": "/download/file_info/{msg_id}",
-                    "method": "GET",
-                    "description": "Get file information from Telegram"
+                    "description": "Get accurate download progress for direct file downloads"
                 }
             },
             "streaming": {
@@ -1027,13 +1636,6 @@ async def root():
                     "path": "/get_stream_url/{msg_id}",
                     "method": "GET",
                     "description": "Get direct PixelDrain URL for streaming"
-                }
-            },
-            "queue": {
-                "queue_status": {
-                    "path": "/queue/status",
-                    "method": "GET",
-                    "description": "Get current download queue status"
                 }
             },
             "system": {
@@ -1058,28 +1660,6 @@ async def root():
                     "description": "Manually trigger cleanup of expired files"
                 }
             },
-            "performance": {
-                "memory_usage": {
-                    "path": "/performance/memory",
-                    "method": "GET",
-                    "description": "Check current memory usage and chunked download settings"
-                },
-                "test_performance": {
-                    "path": "/performance/test",
-                    "method": "GET",
-                    "description": "Test download performance and suggest optimal chunk sizes"
-                },
-                "configure_chunks": {
-                    "path": "/performance/configure?max_chunk_mb={max}&default_chunk_mb={default}&adaptive={bool}",
-                    "method": "POST",
-                    "description": "Dynamically configure chunk sizes"
-                },
-                "test_upload": {
-                    "path": "/test/chunked_upload?size_mb={size}",
-                    "method": "GET",
-                    "description": "Test memory-safe chunked upload"
-                }
-            },
             "gist": {
                 "gist_status": {
                     "path": "/gist/status",
@@ -1102,16 +1682,6 @@ async def root():
                     "path": "/debug/database",
                     "method": "GET",
                     "description": "Check uploaded files database"
-                },
-                "temp_progress": {
-                    "path": "/debug/temp_progress/{msg_id}",
-                    "method": "GET",
-                    "description": "Debug temp file progress"
-                },
-                "episode_debug": {
-                    "path": "/debug/episode/{msg_id}",
-                    "method": "GET",
-                    "description": "Debug specific episode"
                 },
                 "temp_files": {
                     "path": "/temp/files",
@@ -1174,69 +1744,34 @@ async def global_exception_handler(request, exc):
 
 @app.get("/get_stream_url/{msg_id}")
 async def get_stream_url(msg_id: str):
-    """Get direct PixelDrain URL for AVPlay streaming"""
-    print(f"🔍 Stream URL requested for msg_id: {msg_id}")
+    """Get direct stream URL for Smart TV streaming (replaces HLS)"""
+    print(f"🔍 Direct Stream URL requested for msg_id: {msg_id}")
     
-    # Get file URL from database
-    uploaded_files = await load_uploaded_files_db_async()
-    print(f"📋 Database contains {len(uploaded_files)} files")
-    print(f"📋 Available msg_ids: {list(uploaded_files.keys())}")
-    
-    if str(msg_id) not in uploaded_files:
-        print(f"❌ msg_id {msg_id} not found in database")
-        print(f"🔍 Checking if msg_id exists with different type...")
+    # Start direct download process if not already available
+    try:
+        # Check if file is already available
+        filepath = get_direct_file_path(msg_id)
         
-        # Check if exists as int
-        if int(msg_id) in uploaded_files:
-            print(f"✅ Found as integer key: {int(msg_id)}")
-            file_info = uploaded_files[int(msg_id)]
-        else:
-            print(f"❌ msg_id {msg_id} not found as string or integer")
-            raise HTTPException(404, f"File not uploaded yet. Available files: {len(uploaded_files)}")
-    else:
-        file_info = uploaded_files[str(msg_id)]
-    
-    filename = file_info.get("filename", f"{msg_id}.mkv")
-    pixeldrain_id = file_info["pixeldrain_id"]
-    
-    print(f"📁 Found file: {filename}, PixelDrain ID: {pixeldrain_id}")
-    
-    # Verify file still exists on PixelDrain
-    if not await check_pixeldrain_file_exists(pixeldrain_id):
-        # File expired or deleted, remove from database
-        del uploaded_files[str(msg_id)]
-        await save_uploaded_files_db_async(uploaded_files)
-        print(f"❌ File {pixeldrain_id} not found on PixelDrain, removed from database")
-        raise HTTPException(404, "File expired or deleted from PixelDrain")
-    
-    # Check access count
-    access_count = file_info.get("access_count", 0)
-    if access_count >= MAX_ACCESS_COUNT:
-        # File exceeded access limit
-        await delete_from_pixeldrain(pixeldrain_id)
-        del uploaded_files[str(msg_id)]
-        await save_uploaded_files_db_async(uploaded_files)
-        print(f"❌ File {pixeldrain_id} exceeded access limit, deleted")
-        raise HTTPException(410, f"File access limit exceeded ({MAX_ACCESS_COUNT} times). File has been deleted.")
-    
-    # Increment access count
-    file_info["access_count"] = access_count + 1
-    uploaded_files[str(msg_id)] = file_info
-    await save_uploaded_files_db_async(uploaded_files)
-    
-    # Get PixelDrain direct URL
-    pixeldrain_url = get_pixeldrain_download_url(pixeldrain_id)
-    
-    print(f"📺 Providing direct URL for AVPlay: {filename} (access {access_count + 1}/{MAX_ACCESS_COUNT})")
-    print(f"🔗 PixelDrain URL: {pixeldrain_url}")
-    
-    return {
-        "success": True,
-        "stream_url": pixeldrain_url,
-        "filename": filename,
-        "access_count": access_count + 1,
-        "remaining_access": MAX_ACCESS_COUNT - (access_count + 1)
-    }
+        if not filepath:
+            # Start download in background
+            await download_direct_file(msg_id)
+        
+        # Return HLS playlist URL
+        base_url = "http://localhost:8000"  # Adjust based on your server
+        hls_url = f"{base_url}/hls/{msg_id}/playlist.m3u8"
+        
+        print(f"� Providing HLS URL for Smart TV: {hls_url}")
+        
+        return {
+            "success": True,
+            "stream_url": hls_url,
+            "stream_type": "hls",
+            "msg_id": msg_id,
+            "status_url": f"{base_url}/stream_status/{msg_id}"
+        }
+    except Exception as e:
+        print(f"❌ Error getting HLS stream URL: {str(e)}")
+        raise HTTPException(500, f"Failed to prepare HLS stream: {str(e)}")
 
 # Add Gist management endpoints
 
@@ -1504,370 +2039,23 @@ async def debug_database():
     
     return debug_info
 
-@app.get("/debug/temp_progress/{msg_id}")
-async def debug_temp_progress(msg_id: str):
-    """Debug temp file progress without checking download tasks"""
-    try:
-        # Get file info for total size
-        file_info_response = await get_file_info(msg_id)
-        actual_total_size = 0
-        if file_info_response["status"] == "found":
-            actual_total_size = file_info_response["file_size"]
-        
-        # Check temp directory
-        temp_files = []
-        if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
-            temp_dir = CUSTOM_TEMP_DIR
-        else:
-            temp_dir = tempfile.gettempdir()
-        
-        print(f"🔍 [DEBUG] Checking temp directory: {temp_dir}")
-        print(f"🔍 [DEBUG] Looking for patterns: temp_{msg_id} or {msg_id}")
-        
-        try:
-            all_files = os.listdir(temp_dir)
-            print(f"🔍 [DEBUG] Total files in temp dir: {len(all_files)}")
-            
-            for temp_filename in all_files:
-                if f"temp_{msg_id}" in temp_filename or str(msg_id) in temp_filename:
-                    temp_file_path = os.path.join(temp_dir, temp_filename)
-                    if os.path.isfile(temp_file_path):
-                        file_size = os.path.getsize(temp_file_path)
-                        temp_files.append({
-                            "filename": temp_filename,
-                            "path": temp_file_path,
-                            "size": file_size,
-                            "size_mb": file_size / (1024 * 1024),
-                            "modified": os.path.getmtime(temp_file_path),
-                            "modified_readable": time.ctime(os.path.getmtime(temp_file_path))
-                        })
-                        print(f"🔍 [DEBUG] Found matching file: {temp_filename} ({file_size / (1024*1024):.1f} MB)")
-        except Exception as e:
-            print(f"❌ [DEBUG] Error listing temp directory: {e}")
-        
-        # Calculate progress if we have files
-        progress_info = {
-            "msg_id": msg_id,
-            "temp_directory": temp_dir,
-            "total_size": actual_total_size,
-            "total_size_mb": actual_total_size / (1024 * 1024) if actual_total_size > 0 else 0,
-            "temp_files_found": len(temp_files),
-            "temp_files": temp_files
-        }
-        
-        if temp_files:
-            latest_temp = max(temp_files, key=lambda x: x["modified"])
-            downloaded_size = latest_temp["size"]
-            percentage = (downloaded_size / actual_total_size * 100) if actual_total_size > 0 else 0
-            
-            progress_info.update({
-                "latest_temp_file": latest_temp["filename"],
-                "downloaded_size": downloaded_size,
-                "downloaded_size_mb": downloaded_size / (1024 * 1024),
-                "percentage": percentage
-            })
-            
-            print(f"📊 [DEBUG] Progress: {downloaded_size / (1024*1024):.1f}MB / {actual_total_size / (1024*1024):.1f}MB ({percentage:.1f}%)")
-        
-        return progress_info
-        
-    except Exception as e:
-        print(f"❌ [DEBUG] Error in debug_temp_progress: {e}")
-        import traceback
-        print(f"🔍 [DEBUG] Full traceback: {traceback.format_exc()}")
-        return {
-            "error": str(e),
-            "msg_id": msg_id
-        }
-
-# Debug endpoint to check specific episode
-@app.get("/debug/episode/{msg_id}")
-async def debug_episode(msg_id: str):
-    """Debug specific episode"""
-    uploaded_files = load_uploaded_files_db()
-    
-    # Check download tasks
-    msg_id_int = int(msg_id)
-    download_in_progress = (msg_id_int in download_tasks) or (str(msg_id) in download_tasks)
-    
-    # Check temp files
-    temp_files = []
-    if CUSTOM_TEMP_DIR and os.path.exists(CUSTOM_TEMP_DIR):
-        temp_dir = CUSTOM_TEMP_DIR
-    else:
-        temp_dir = tempfile.gettempdir()
-    
-    try:
-        for temp_filename in os.listdir(temp_dir):
-            if f"temp_{msg_id}" in temp_filename or str(msg_id) in temp_filename:
-                temp_file_path = os.path.join(temp_dir, temp_filename)
-                if os.path.isfile(temp_file_path):
-                    file_size = os.path.getsize(temp_file_path)
-                    temp_files.append({
-                        "filename": temp_filename,
-                        "size_mb": file_size / (1024 * 1024),
-                        "size_bytes": file_size,
-                        "modified": time.ctime(os.path.getmtime(temp_file_path))
-                    })
-    except Exception as e:
-        temp_files = [{"error": str(e)}]
-    
-    return {
-        "msg_id": msg_id,
-        "exists_as_string": str(msg_id) in uploaded_files,
-        "exists_as_int": int(msg_id) in uploaded_files,
-        "database_keys": list(uploaded_files.keys()),
-        "database_size": len(uploaded_files),
-        "file_info": uploaded_files.get(str(msg_id), uploaded_files.get(int(msg_id), "Not found")),
-        "download_tasks": {
-            "global_download_tasks_keys": list(download_tasks.keys()),
-            "queue_manager_tasks_keys": list(queue_manager.download_tasks.keys()),
-            "msg_id_int_in_global_tasks": msg_id_int in download_tasks,
-            "msg_id_str_in_global_tasks": str(msg_id) in download_tasks,
-            "msg_id_in_queue_manager": queue_manager.is_download_in_progress(msg_id_int),
-            "download_in_progress_old_method": msg_id_int in download_tasks or str(msg_id) in download_tasks,
-            "download_in_progress_queue_manager": queue_manager.is_download_in_progress(msg_id_int)
-        },
-        "temp_directory": temp_dir,
-        "temp_files": temp_files
-    }
-
-# Season download endpoints
-@app.post("/download/season")
-async def download_season(request: Request):
-    """Download all episodes from a season using the smart queue system"""
-    try:
-        # Get parameters from query string
-        series_name = request.query_params.get('series_name')
-        season_name = request.query_params.get('season_name')
-        
-        if not series_name or not season_name:
-            raise HTTPException(status_code=400, detail="Missing series_name or season_name parameters")
-        
-        print(f"📋 Season download request: {series_name} - {season_name}")
-        
-        # Load episode data
-        data = await load_video_data()
-        
-        if series_name not in data or season_name not in data[series_name]:
-            raise HTTPException(status_code=404, detail="Season not found")
-        
-        episodes = data[series_name][season_name]
-        uploaded_files = await load_uploaded_files_db_async()
-        
-        # Filter episodes that need downloading
-        episodes_to_download = []
-        for ep in episodes:
-            _, msg_id = parse_telegram_url(ep["url"])
-            ep["msg_id"] = msg_id
-            ep["series_name"] = series_name
-            ep["season_name"] = season_name
-            
-            # Skip if already uploaded and still exists
-            if str(msg_id) in uploaded_files:
-                file_info = uploaded_files[str(msg_id)]
-                access_count = file_info.get("access_count", 0)
-                if access_count < MAX_ACCESS_COUNT:
-                    # Check if file still exists on PixelDrain
-                    if await check_pixeldrain_file_exists(file_info["pixeldrain_id"]):
-                        continue  # Skip this episode
-            
-            episodes_to_download.append(ep)
-        
-        if not episodes_to_download:
-            return {
-                "status": "already_downloaded",
-                "message": "All episodes are already downloaded",
-                "total_episodes": len(episodes),
-                "episodes_to_download": 0
-            }
-        
-        # Queue all episodes using the new queue system (LOW priority)
-        queued_count = 0
-        failed_count = 0
-        
-        for episode in episodes_to_download:
-            try:
-                success = await download_scheduler.queue_season_episode_download(episode, client)
-                if success:
-                    queued_count += 1
-                else:
-                    failed_count += 1
-            except Exception as e:
-                print(f"❌ Failed to queue episode {episode['title']}: {e}")
-                failed_count += 1
-        
-        print(f"📋 Queued {queued_count} episodes for season {season_name}")
-        
-        return {
-            "status": "queued",
-            "series_name": series_name,
-            "season_name": season_name,
-            "message": f"Queued {queued_count} episodes for download (LOW priority)",
-            "total_episodes": len(episodes),
-            "episodes_to_download": len(episodes_to_download),
-            "episodes_already_downloaded": len(episodes) - len(episodes_to_download),
-            "queued_count": queued_count,
-            "failed_count": failed_count,
-            "note": "Episodes will be downloaded after all single episode requests"
-        }
-        
-    except Exception as e:
-        print(f"❌ Error queuing season download: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/download/season/status")
-async def get_season_download_status():
-    """Get status of all season downloads"""
-    status_info = {}
-    
-    for season_id, info in season_download_queue.items():
-        status_info[season_id] = {
-            "series_name": info["series_name"],
-            "season_name": info["season_name"],
-            "total_episodes": info["total_episodes"],
-            "downloaded_count": info["downloaded_count"],
-            "failed_count": info["failed_count"],
-            "status": info["status"],
-            "progress_percentage": (info["downloaded_count"] / info["total_episodes"]) * 100 if info["total_episodes"] > 0 else 0,
-            "current_episode": info.get("current_episode", {}).get("title", "None") if info.get("current_episode") else "None",
-            "started_at": info["started_at"]
-        }
-    
-    return {
-        "season_downloads": status_info,
-        "active_downloads": len([info for info in season_download_queue.values() if info["status"] in ["downloading", "queued"]]),
-        "processor_running": season_download_task is not None and not season_download_task.done()
-    }
-
-@app.delete("/download/season/{season_id}")
-async def cancel_season_download(season_id: str):
-    """Cancel a season download"""
-    if season_id in season_download_queue:
-        season_info = season_download_queue[season_id]
-        if season_info["status"] in ["queued", "downloading"]:
-            season_info["status"] = "cancelled"
-            print(f"🚫 Cancelled season download: {season_info['season_name']}")
-            return {"status": "cancelled", "message": "Season download cancelled"}
-        else:
-            return {"status": "error", "message": "Season download cannot be cancelled"}
-    else:
-        raise HTTPException(status_code=404, detail="Season download not found")
-
-
-
 # === Mobile/PC streaming endpoints (Testing) === #
 
 @app.get("/stream_mobile/{msg_id}")
 async def stream_mobile(msg_id: str, request: Request):
     """
-    Mobile/PC streaming endpoint with improved coordination and VLC compatibility
+    Mobile/PC streaming endpoint using direct streaming (replaces HLS)
     """
-    print(f"📱 Mobile stream request for msg_id: {msg_id}")
+    print(f"📱 Mobile direct stream request for msg_id: {msg_id}")
     
-    # Use a lock per msg_id to prevent concurrent download triggers
-    if msg_id not in mobile_stream_locks:
-        mobile_stream_locks[msg_id] = threading.Lock()
-    
-    with mobile_stream_locks[msg_id]:
-        try:
-            # First check if file is already on PixelDrain
-            uploaded_files = load_uploaded_files_db()
-            
-            if str(msg_id) in uploaded_files:
-                file_info = uploaded_files[str(msg_id)]
-                pixeldrain_id = file_info["pixeldrain_id"]
-                
-                # Verify file still exists on PixelDrain
-                if await check_pixeldrain_file_exists(pixeldrain_id):
-                    # Check access count
-                    access_count = file_info.get("access_count", 0)
-                    if access_count < MAX_ACCESS_COUNT:
-                        print(f"📱 File already on PixelDrain, redirecting to direct stream")
-                        
-                        # Increment access count
-                        file_info["access_count"] = access_count + 1
-                        uploaded_files[str(msg_id)] = file_info
-                        save_uploaded_files_db(uploaded_files)
-                        
-                        # Get PixelDrain direct URL
-                        pixeldrain_url = get_pixeldrain_download_url(pixeldrain_id)
-                        
-                        # For mobile/PC, redirect to PixelDrain
-                        from fastapi.responses import RedirectResponse
-                        return RedirectResponse(url=pixeldrain_url, status_code=302)
-                    else:
-                        # File exceeded access limit, remove and continue to download
-                        await delete_from_pixeldrain(pixeldrain_id)
-                        del uploaded_files[str(msg_id)]
-                        save_uploaded_files_db(uploaded_files)
-                else:
-                    # File doesn't exist on PixelDrain anymore, remove from DB
-                    del uploaded_files[str(msg_id)]
-                    save_uploaded_files_db(uploaded_files)
-            
-            # File not on PixelDrain - need to download and stream simultaneously
-            print(f"📱 File not on PixelDrain, starting download and streaming")
-            
-            # Get file info first
-            file_info_response = await get_file_info(msg_id)
-            if file_info_response["status"] != "found":
-                raise HTTPException(404, "Episode not found in catalog")
-            
-            total_file_size = file_info_response["file_size"]
-            filename = file_info_response["filename"]
-            
-            # Check if download is already in progress
-            msg_id_int = int(msg_id)
-            download_in_progress = queue_manager.is_download_in_progress(msg_id_int)
-            
-            # Only trigger download if not already in progress
-            if not download_in_progress and msg_id not in mobile_stream_status:
-                # Trigger download using existing system
-                print(f"📱 Triggering download for streaming: {filename}")
-                
-                # Find the episode URL from video.json
-                episode_url = None
-                with open("video.json", encoding="utf-8") as f:
-                    data = json.load(f)
-                    for series_name, series_data in data.items():
-                        for season_name, episodes in series_data.items():
-                            for episode in episodes:
-                                _, ep_msg_id = parse_telegram_url(episode["url"])
-                                if ep_msg_id == msg_id_int:
-                                    episode_url = episode["url"]
-                                    break
-                            if episode_url:
-                                break
-                        if episode_url:
-                            break
-                
-                if not episode_url:
-                    raise HTTPException(404, "Episode URL not found")
-                
-                # Queue the download (HIGH priority for mobile streaming)
-                try:
-                    await download_scheduler.queue_single_episode_download(episode_url, client)
-                    print(f"📱 Download queued successfully for mobile streaming")
-                    
-                    # Mark as being handled
-                    mobile_stream_status[msg_id] = {
-                        "triggered_at": time.time(),
-                        "total_size": total_file_size,
-                        "filename": filename
-                    }
-                except Exception as e:
-                    print(f"❌ Failed to queue download: {e}")
-                    # Continue anyway, maybe download is already in progress
-            
-            # Stream from temp file with improved coordination
-            return await stream_from_temp_file_improved(msg_id, total_file_size, filename, request)
-            
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(f"❌ Error in mobile streaming: {e}")
-            raise HTTPException(500, f"Streaming failed: {str(e)}")
+    try:
+        # Redirect to direct streaming endpoint
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse(url=f"/direct/{msg_id}", status_code=302)
+        
+    except Exception as e:
+        print(f"❌ Error in mobile direct streaming: {e}")
+        raise HTTPException(500, f"Mobile streaming failed: {str(e)}")
 
 async def stream_from_temp_file_improved(msg_id: str, total_file_size: int, filename: str, request: Request):
     """
@@ -2073,37 +2261,6 @@ async def stream_temp_file_complete_improved(temp_file_path: str, total_size: in
                 
     except Exception as e:
         print(f"❌ Error streaming complete file: {e}")
-
-# Also update the HEAD handler for better VLC compatibility
-@app.head("/stream_mobile/{msg_id}")
-async def stream_mobile_head(msg_id: str):
-    """HEAD request for mobile streaming - returns headers without body"""
-    try:
-        # Get file info
-        file_info_response = await get_file_info(msg_id)
-        if file_info_response["status"] != "found":
-            raise HTTPException(404, "Episode not found")
-        
-        total_file_size = file_info_response["file_size"]
-        
-        return JSONResponse(
-            content={},
-            headers={
-                'Content-Type': 'video/mp4',
-                'Accept-Ranges': 'bytes',
-                'Content-Length': str(total_file_size),
-                'Cache-Control': 'no-cache',
-                'Connection': 'keep-alive',
-                'Access-Control-Allow-Origin': '*',
-                'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
-                'Access-Control-Allow-Headers': 'Range, Content-Range, Content-Length'
-            }
-        )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(500, str(e))
-
 
 @app.get("/catalog/episode/{msg_id}")
 async def get_episode_by_msg_id(msg_id: str):

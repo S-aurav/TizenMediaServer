@@ -193,11 +193,6 @@
       border-color: transparent;
     }
 
-    .episode-card.downloaded {
-      background: #2a2a2a;
-      border-color: #28a745;
-    }
-
     .episode-title {
       font-size: 22px;
       font-weight: bold;
@@ -209,34 +204,6 @@
       font-size: 16px;
       color: #bbb;
       margin-bottom: 10px;
-    }
-
-    .episode-status {
-      font-size: 14px;
-      margin-top: 5px;
-      color: #28a745;
-    }
-
-    .episode-card button {
-      background: #333;
-      color: white;
-      border: 2px solid #666;
-      padding: 15px 25px;
-      font-size: 18px;
-      cursor: pointer;
-      border-radius: 8px;
-      min-width: 120px;
-      transition: all 0.3s ease;
-      position: absolute;
-      right: 20px;
-      top: 50%;
-      transform: translateY(-50%);
-    }
-
-    .episode-card button.selected {
-      background: #ff6b6b;
-      border-color: white;
-      transform: translateY(-50%) scale(1.1);
     }
 
     /* Simple Dialog styles */
@@ -663,6 +630,33 @@
   </div>
 </div>
 
+<!-- Download Progress Modal -->
+<div id="downloadProgressModal" class="loading-modal">
+  <div class="loading-content">
+    <div class="loading-spinner"></div>
+    <div class="loading-text">Downloading Episode</div>
+    <div class="loading-details" id="downloadEpisodeTitle">Episode Title</div>
+    
+    <!-- Download Progress Information -->
+    <div style="margin: 20px 0; padding: 15px; background: rgba(255,255,255,0.1); border-radius: 8px;">
+      <div id="downloadProgressText" style="color: #ccc; font-size: 14px; margin-bottom: 10px;">
+        Preparing download...
+      </div>
+      <div style="background: #333; height: 8px; border-radius: 4px; overflow: hidden; margin: 10px 0;">
+        <div id="downloadProgressBar" style="height: 100%; background: linear-gradient(90deg, #4CAF50, #8BC34A); width: 0%; transition: width 0.3s ease;"></div>
+      </div>
+      <div style="display: flex; justify-content: space-between; font-size: 12px; color: #aaa;">
+        <span id="downloadSize">Calculating size...</span>
+        <span id="downloadPercentage">0%</span>
+      </div>
+    </div>
+    
+    <div style="margin-top: 15px; color: #ccc; font-size: 16px;">
+      Press BACK button to cancel
+    </div>
+  </div>
+</div>
+
 <!-- Next Episode Download Modal -->
 <div id="nextEpisodeModal" class="loading-modal">
   <div class="loading-content">
@@ -720,7 +714,7 @@
 </div>
 
 <script>
-var SERVER = "url";
+var SERVER = "http://localhost:8000";
 // Performance monitoring
 var debugPerformance = function(operation, startTime) {
   var endTime = performance.now();
@@ -736,6 +730,17 @@ var debug = function(msg) {
   } catch (e) {
     console.error("Debug element not found:", e);
   }
+};
+
+var showToast = function(message, type) {
+  type = type || "info"; // Default to info if no type specified
+  debug("🍞 Toast (" + type + "): " + message);
+  
+  // For now, just use debug display
+  // In a full implementation, you might want to create a proper toast UI
+  setTimeout(function() {
+    debug(""); // Clear the message after a few seconds
+  }, 5000);
 };
 
 var avplayObj = null;
@@ -808,6 +813,11 @@ var state = {
     active: false,
     cancelled: false,
     episodeMsgId: null
+  },
+  // Download progress modal state
+  downloadModal: {
+    visible: false,
+    progressInterval: null
   }
 };
 
@@ -1021,7 +1031,6 @@ async function renderEpisodes() {
   var container = document.getElementById("app");
   container.innerHTML = 
     '<div class="title">🎬 Episodes</div>' +
-    '<div id="queueStatus" style="margin-bottom: 20px; padding: 10px; background: rgba(255,255,255,0.1); border-radius: 5px; display: none;"></div>' +
     '<div class="episode-grid" id="episode-list"></div>';
 
   var list = document.getElementById("episode-list");
@@ -1032,12 +1041,10 @@ async function renderEpisodes() {
   for (var i = 0; i < episodes.length; i++) {
     var ep = episodes[i];
     var isSelected = i === state.selectedEpisode;
-    var isDownloaded = ep.downloaded || false;
 
     var card = document.createElement("div");
     var cardClass = "episode-card";
     if (isSelected) cardClass += " selected";
-    if (isDownloaded) cardClass += " downloaded";
     
     card.className = cardClass;
     card.tabIndex = 0;
@@ -1045,20 +1052,10 @@ async function renderEpisodes() {
 
     card.innerHTML = 
       '<div class="episode-title">' + escapeHtml(ep.title) + '</div>' +
-      '<div class="episode-details">Episode ID: ' + ep.msg_id + '</div>' +
-      '<div class="episode-status">' + (isDownloaded ? 'Downloaded' : 'Not Downloaded') + '</div>';
+      '<div class="episode-details">Episode ID: ' + ep.msg_id + '</div>';
 
     // Use event delegation for better performance - attach listeners to parent
     card.onclick = createEpisodeClickHandler(i);
-
-    // Add download button only for non-downloaded episodes
-    if (!isDownloaded) {
-      var downloadBtn = document.createElement("button");
-      downloadBtn.textContent = "⬇️ Download";
-      downloadBtn.setAttribute('data-episode-index', i);
-      downloadBtn.onclick = createDownloadClickHandler(i);
-      card.appendChild(downloadBtn);
-    }
 
     fragment.appendChild(card);
   }
@@ -1128,25 +1125,8 @@ function createEpisodeClickHandler(index) {
       return;
     }
     
-    if (currentEpisode.downloaded) {
-      playEpisode(currentEpisode);
-    } else {
-      downloadEpisode(currentEpisode);
-    }
-  };
-}
-
-function createDownloadClickHandler(index) {
-  return function(e) {
-    e.stopPropagation();
-    // Validate state before accessing episode
-    if (state.view !== "episodes" || index >= state.episodeList.length || index < 0) {
-      debug("❌ Invalid button access - state mismatch");
-      return;
-    }
-    var currentEpisode = state.episodeList[index];
-    if (!currentEpisode) return;
-    downloadEpisode(currentEpisode);
+    // Always play episode directly with new streaming approach
+    playEpisode(currentEpisode);
   };
 }
 
@@ -1163,25 +1143,8 @@ function updateEpisodeFocus() {
     // Update card selection
     if (isSelected) {
       card.classList.add("selected");
-      // If button is focused, remove card focus border
-      if (state.focusMode === "button") {
-        card.classList.add("button-focused");
-      } else {
-        card.classList.remove("button-focused");
-      }
     } else {
       card.classList.remove("selected");
-      card.classList.remove("button-focused");
-    }
-    
-    // Update button focus if card has a download button
-    var downloadBtn = card.querySelector("button");
-    if (downloadBtn) {
-      if (state.focusMode === "button" && isSelected) {
-        downloadBtn.classList.add("selected");
-      } else {
-        downloadBtn.classList.remove("selected");
-      }
     }
   }
 }
@@ -1189,7 +1152,6 @@ function updateEpisodeFocus() {
 async function playEpisode(episode) {
   debug("🎬 Playing episode: " + episode.title);
   debug("🔍 Episode msg_id: " + episode.msg_id);
-  showLoadingModal("Preparing Video", "Getting stream URL...");
   
   // Find current episode index for auto-play feature
   state.videoPlayer.currentEpisodeIndex = -1;
@@ -1200,32 +1162,48 @@ async function playEpisode(episode) {
     }
   }
   
-  // Check and pre-download next episode if needed
-  checkAndPreDownloadNextEpisode();
+  // Check if episode is available on server first
+  showLoadingModal("Checking Episode", "Verifying episode availability...");
   
   try {
-    // Get direct PixelDrain URL from server
-    var streamUrlEndpoint = SERVER + "/get_stream_url/" + episode.msg_id;
-    debug("📡 Requesting: " + streamUrlEndpoint);
+    // Check if episode is ready for direct streaming
+    var statusResponse = await fetch(SERVER + "/direct/status/" + episode.msg_id);
+    var statusData = await statusResponse.json();
     
-    var response = await fetch(streamUrlEndpoint);
-    
-    if (!response.ok) {
-      var errorText = await response.text();
-      throw new Error("Server error " + response.status + ": " + errorText);
+    if (statusData.available) {
+      // Episode is ready, start direct streaming
+      debug("✅ Episode ready for direct streaming");
+      startDirectStreaming(episode);
+    } else {
+      // Episode needs to be downloaded first
+      debug("⬇️ Episode not ready, starting download...");
+      hideLoadingModal();
+      showDownloadProgressModal(episode);
+      await downloadAndStreamEpisode(episode);
     }
     
-    var streamData = await response.json();
+    // Start auto-downloading next episode in background
+    checkAndPreDownloadNextEpisode();
     
-    if (!streamData.success) {
-      throw new Error("Failed to get stream URL: " + (streamData.error || "Unknown error"));
-    }
-    
-    var streamUrl = streamData.stream_url;
-    
-    debug("📡 Got PixelDrain URL: " + streamUrl);
-    debug("📊 Access count: " + streamData.access_count + "/" + (streamData.access_count + streamData.remaining_access));
+  } catch (error) {
+    debug("❌ Error checking episode status: " + error.message);
     hideLoadingModal();
+    showLoadingModal("Error", "Failed to check episode: " + error.message);
+    setTimeout(function() {
+      hideLoadingModal();
+    }, 3000);
+  }
+}
+
+async function startDirectStreaming(episode) {
+  debug("🚀 Starting direct streaming for: " + episode.title);
+  
+  try {
+    var streamUrl = SERVER + "/direct/" + episode.msg_id;
+    debug("📡 Direct stream URL: " + streamUrl);
+    
+    // Hide all modals before starting video
+    hideAllModals();
     
     // Use AVPlay for Smart TV playback
     if (typeof webapis !== 'undefined' && webapis.avplay) {
@@ -1240,47 +1218,188 @@ async function playEpisode(episode) {
     }
     
   } catch (error) {
-    debug("❌ Error: " + error.message);
+    debug("❌ Error starting direct streaming: " + error.message);
     hideLoadingModal();
+    showLoadingModal("Streaming Error", "Failed to start streaming: " + error.message);
+    setTimeout(function() {
+      hideLoadingModal();
+    }, 3000);
+  }
+}
+
+async function downloadAndStreamEpisode(episode) {
+  debug("⬇️ Downloading and preparing episode: " + episode.title);
+  
+  try {
+    // Start download on server
+    var downloadResponse = await fetch(SERVER + "/download?url=" + encodeURIComponent(episode.url));
+    var downloadData = await downloadResponse.json();
     
-    // Check specific error types
-    if (error.message.includes("404")) {
-      debug("⚠️ Episode not found - may not be uploaded yet");
-      showLoadingModal("Episode Not Ready", "Episode may not be uploaded yet. Try downloading it first.");
-      setTimeout(function() {
-        hideLoadingModal();
-        renderEpisodes();
-      }, 3000);
-    } else if (error.message.includes("410")) {
-      debug("⚠️ Episode access limit exceeded");
-      showLoadingModal("Access Limit Exceeded", "This episode has been accessed too many times and was deleted. Download again if needed.");
-      setTimeout(function() {
-        hideLoadingModal();
-        renderEpisodes();
-      }, 3000);
+    if (downloadData.status === "already_uploaded") {
+      debug("✅ Episode marked as already uploaded, but checking direct availability...");
+      // Double-check if it's really available for direct streaming
+      var statusResponse = await fetch(SERVER + "/direct/status/" + episode.msg_id);
+      var statusData = await statusResponse.json();
+      
+      if (statusData.available) {
+        debug("✅ Episode confirmed available for direct streaming");
+        hideDownloadProgressModal();
+        startDirectStreaming(episode);
+        return;
+      } else {
+        debug("⚠️ Episode marked as uploaded but not available for direct streaming, monitoring...");
+        // Start monitoring anyway as there might be a delay
+        monitorDownloadProgress(episode, downloadData.msg_id || episode.msg_id);
+      }
+    } else if (downloadData.status === "queued" || downloadData.status === "already_queued") {
+      debug("📥 Download queued, monitoring progress...");
+      monitorDownloadProgress(episode, downloadData.msg_id);
     } else {
-      // Check if this episode is actually downloaded
-      debug("🔍 Checking episode download status...");
-      if (!episode.downloaded) {
-        debug("⚠️ Episode shows as not downloaded, triggering download");
-        downloadEpisode(episode);
+      throw new Error("Download failed: " + (downloadData.message || "Unknown error"));
+    }
+    
+  } catch (error) {
+    debug("❌ Download error: " + error.message);
+    hideDownloadProgressModal();
+    showLoadingModal("Download Error", "Failed to download episode: " + error.message);
+    setTimeout(function() {
+      hideLoadingModal();
+    }, 3000);
+  }
+}
+
+function showDownloadProgressModal(episode) {
+  debug("📥 Showing download progress modal for: " + episode.title);
+  
+  document.getElementById("downloadEpisodeTitle").textContent = episode.title;
+  document.getElementById("downloadProgressText").textContent = "Preparing download...";
+  document.getElementById("downloadProgressBar").style.width = "0%";
+  document.getElementById("downloadPercentage").textContent = "0%";
+  document.getElementById("downloadSize").textContent = "Calculating size...";
+  
+  var modal = document.getElementById("downloadProgressModal");
+  modal.classList.add("show");
+  state.downloadModal.visible = true;
+}
+
+function hideDownloadProgressModal() {
+  var modal = document.getElementById("downloadProgressModal");
+  modal.classList.remove("show");
+  state.downloadModal.visible = false;
+  
+  // Clean up any progress monitoring
+  if (state.downloadModal.progressInterval) {
+    clearInterval(state.downloadModal.progressInterval);
+    state.downloadModal.progressInterval = null;
+  }
+}
+
+function updateDownloadProgress(percentage, downloadedSize, totalSize, status) {
+  if (!state.downloadModal.visible) return;
+  
+  document.getElementById("downloadProgressBar").style.width = percentage + "%";
+  document.getElementById("downloadPercentage").textContent = percentage.toFixed(1) + "%";
+  
+  if (totalSize > 0) {
+    var downloadedMB = (downloadedSize / (1024 * 1024)).toFixed(1);
+    var totalMB = (totalSize / (1024 * 1024)).toFixed(1);
+    document.getElementById("downloadSize").textContent = downloadedMB + " MB / " + totalMB + " MB";
+  }
+  
+  document.getElementById("downloadProgressText").textContent = status || "Downloading...";
+}
+
+function monitorDownloadProgress(episode, msgId) {
+  debug("👀 Starting download progress monitoring for: " + episode.title);
+  
+  var startTime = Date.now();
+  var maxMonitorTime = 15 * 60 * 1000; // 15 minutes max
+  
+  // Reset error count for new monitoring
+  state.downloadModal.errorCount = 0;
+  
+  state.downloadModal.progressInterval = setInterval(async function() {
+    try {
+      // Check if we've been monitoring too long
+      if (Date.now() - startTime > maxMonitorTime) {
+        debug("⏰ Download monitoring timeout after 15 minutes");
+        if (state.downloadModal.progressInterval) {
+          clearInterval(state.downloadModal.progressInterval);
+          state.downloadModal.progressInterval = null;
+        }
+        hideDownloadProgressModal();
+        showToast("Download is taking too long. Please try again.", "error");
         return;
       }
       
-      // Show detailed error to user
-      showLoadingModal("Error", "Failed to load video: " + error.message);
-      setTimeout(function() {
-        hideLoadingModal();
-        // Refresh episodes to update status
-        renderEpisodes();
-      }, 3000);
+      var progressResponse = await fetch(SERVER + "/download/real_progress/" + msgId);
+      var progressData = await progressResponse.json();
+      
+      if (progressData.status === "downloading" && progressData.temp_file_found) {
+        var percentage = progressData.percentage || 0;
+        var downloadedSize = progressData.downloaded_size || 0;
+        var totalSize = progressData.total_size || 0;
+        
+        updateDownloadProgress(percentage, downloadedSize, totalSize, "Downloading episode...");
+        
+        debug("📊 Progress: " + percentage.toFixed(1) + "% (" + 
+              (downloadedSize / (1024*1024)).toFixed(1) + "/" + 
+              (totalSize / (1024*1024)).toFixed(1) + " MB)");
+              
+      } else if (progressData.status === "not_downloading") {
+        // Download completed, check if episode is ready
+        debug("✅ Download completed, checking availability...");
+        
+        // Clear the interval since download is done
+        if (state.downloadModal.progressInterval) {
+          clearInterval(state.downloadModal.progressInterval);
+          state.downloadModal.progressInterval = null;
+        }
+        
+        var statusResponse = await fetch(SERVER + "/direct/status/" + msgId);
+        var statusData = await statusResponse.json();
+        
+        if (statusData.available) {
+          debug("🎬 Episode ready for streaming!");
+          hideDownloadProgressModal();
+          startDirectStreaming(episode);
+        } else {
+          // Episode still not ready, hide modal and show error
+          hideDownloadProgressModal();
+          showToast("Episode download completed but not ready for streaming", "error");
+        }
+      } else if (progressData.status === "downloading" && !progressData.temp_file_found) {
+        updateDownloadProgress(0, 0, 0, "Starting download...");
+      }
+      
+    } catch (error) {
+      debug("❌ Error monitoring progress: " + error.message);
+      
+      // If there are repeated errors, stop monitoring
+      if (!state.downloadModal.errorCount) {
+        state.downloadModal.errorCount = 0;
+      }
+      state.downloadModal.errorCount++;
+      
+      if (state.downloadModal.errorCount >= 5) {
+        debug("🚫 Too many errors, stopping progress monitoring");
+        if (state.downloadModal.progressInterval) {
+          clearInterval(state.downloadModal.progressInterval);
+          state.downloadModal.progressInterval = null;
+        }
+        hideDownloadProgressModal();
+        showToast("Error monitoring download progress. Please try again.", "error");
+      }
     }
-  }
+  }, 2000); // Check every 2 seconds
 }
 
 function startVideoPlayback(episode, videoUrl) {
   debug("🎬 Starting video playback for: " + episode.title);
   debug("  Video URL: " + videoUrl);
+  
+  // Ensure ALL modals are hidden when video starts
+  hideAllModals();
   
   try {
     // Clean up any existing video
@@ -1908,6 +2027,20 @@ function hideLoadingModal() {
   state.loadingVisible = false;
 }
 
+function hideAllModals() {
+  // Hide all possible modals
+  hideLoadingModal();
+  hideDownloadProgressModal();
+  
+  // Also hide next episode modal if it exists
+  var nextEpisodeModal = document.getElementById("nextEpisodeModal");
+  if (nextEpisodeModal) {
+    nextEpisodeModal.classList.remove("show");
+  }
+  
+  debug("🚫 All modals hidden");
+}
+
 function scrollIntoViewIfNeeded(containerSelector, index) {
   var container = document.querySelector(containerSelector);
   if (!container) return;
@@ -2480,6 +2613,15 @@ function handleKey(code) {
     return;
   }
   
+  // Handle download progress modal
+  if (state.downloadModal.visible) {
+    if (code === 10009) { // Back button - cancel download
+      debug("🚫 User cancelled download");
+      hideDownloadProgressModal();
+    }
+    return;
+  }
+  
   // Handle next episode download modal
   if (document.getElementById("nextEpisodeModal").classList.contains("show")) {
     if (code === 10009) { // Back button - return to episodes
@@ -2728,55 +2870,60 @@ function checkAndPreDownloadNextEpisode() {
   
   state.videoPlayer.nextEpisodeAvailable = true;
   
-  if (nextEpisode.downloaded) {
-    debug("✅ Next episode already downloaded: " + nextEpisode.title);
-    state.videoPlayer.nextEpisodeDownloading = false;
-  } else {
-    debug("⬇️ Pre-downloading next episode: " + nextEpisode.title);
-    state.videoPlayer.nextEpisodeDownloading = true;
-    state.videoPlayer.preDownloadTriggered = true;
-    
-    // Trigger download for next episode
-    fetch(SERVER + "/download?url=" + encodeURIComponent(nextEpisode.url))
-      .then(function(res) { return res.json(); })
-      .then(function(data) {
-        if (data.status === "uploading" || data.status === "already_uploaded") {
-          debug("✅ Pre-download started for next episode");
-          // Monitor download progress
-          monitorNextEpisodeDownload(nextEpisode);
-        } else {
-          debug("❌ Pre-download failed: " + JSON.stringify(data));
-          state.videoPlayer.nextEpisodeDownloading = false;
-        }
-      })
-      .catch(function(err) {
-        debug("❌ Pre-download error: " + err.message);
+  // Check if next episode is available on server
+  debug("🔍 Checking next episode availability: " + nextEpisode.title);
+  
+  fetch(SERVER + "/direct/status/" + nextEpisode.msg_id)
+    .then(function(response) { return response.json(); })
+    .then(function(statusData) {
+      if (statusData.available) {
+        debug("✅ Next episode already available: " + nextEpisode.title);
         state.videoPlayer.nextEpisodeDownloading = false;
-      });
-  }
+      } else {
+        debug("⬇️ Pre-downloading next episode: " + nextEpisode.title);
+        state.videoPlayer.nextEpisodeDownloading = true;
+        
+        // Start background download for next episode
+        fetch(SERVER + "/download?url=" + encodeURIComponent(nextEpisode.url))
+          .then(function(res) { return res.json(); })
+          .then(function(data) {
+            if (data.status === "queued" || data.status === "already_uploaded" || data.status === "already_queued") {
+              debug("✅ Pre-download started for next episode");
+              monitorNextEpisodeDownload(nextEpisode, data.msg_id);
+            } else {
+              debug("❌ Pre-download failed: " + JSON.stringify(data));
+              state.videoPlayer.nextEpisodeDownloading = false;
+            }
+          })
+          .catch(function(err) {
+            debug("❌ Pre-download error: " + err.message);
+            state.videoPlayer.nextEpisodeDownloading = false;
+          });
+      }
+    })
+    .catch(function(error) {
+      debug("❌ Error checking next episode status: " + error.message);
+    });
 }
 
-function monitorNextEpisodeDownload(nextEpisode) {
-  // Check download status every 3 seconds
+function monitorNextEpisodeDownload(nextEpisode, msgId) {
+  debug("👀 Monitoring background download for: " + nextEpisode.title);
+  
+  // Check download status every 5 seconds (background monitoring)
   var checkInterval = setInterval(function() {
-    // Refresh episode list to check if download completed
-    fetchEpisodes().then(function(episodes) {
-      state.episodeList = episodes;
-      
-      // Find the next episode in updated list
-      var nextIndex = state.videoPlayer.currentEpisodeIndex + 1;
-      if (nextIndex < episodes.length) {
-        var updatedNextEpisode = episodes[nextIndex];
-        if (updatedNextEpisode.downloaded) {
-          debug("✅ Next episode download completed: " + updatedNextEpisode.title);
+    fetch(SERVER + "/direct/status/" + msgId)
+      .then(function(response) { return response.json(); })
+      .then(function(statusData) {
+        if (statusData.available) {
+          debug("✅ Next episode download completed: " + nextEpisode.title);
           state.videoPlayer.nextEpisodeDownloading = false;
           clearInterval(checkInterval);
         }
-      }
-    }).catch(function(error) {
-      debug("❌ Error checking next episode status: " + error.message);
-    });
-  }, 3000);
+      })
+      .catch(function(error) {
+        debug("❌ Error monitoring next episode: " + error.message);
+      });
+  }, 5000); // Check every 5 seconds
   
   // Stop monitoring after 10 minutes
   setTimeout(function() {
@@ -2788,13 +2935,14 @@ function monitorNextEpisodeDownload(nextEpisode) {
 function handleVideoCompletion() {
   debug("🎬 Video completed - checking for next episode");
   
-  if (!state.videoPlayer.nextEpisodeAvailable) {
+  var nextIndex = state.videoPlayer.currentEpisodeIndex + 1;
+  
+  if (nextIndex >= state.episodeList.length) {
     debug("📺 No more episodes, stopping playback");
     stopVideo();
     return;
   }
   
-  var nextIndex = state.videoPlayer.currentEpisodeIndex + 1;
   var nextEpisode = state.episodeList[nextIndex];
   
   if (!nextEpisode) {
@@ -2803,25 +2951,69 @@ function handleVideoCompletion() {
     return;
   }
   
-  // Check if next episode is downloaded
-  if (nextEpisode.downloaded) {
-    debug("🎬 Auto-playing next episode: " + nextEpisode.title);
-    // Auto-play next episode
-    setTimeout(function() {
+  debug("🔍 Checking next episode availability: " + nextEpisode.title);
+  
+  // Check if next episode is ready for streaming
+  fetch(SERVER + "/direct/status/" + nextEpisode.msg_id)
+    .then(function(response) { return response.json(); })
+    .then(function(statusData) {
+      if (statusData.available) {
+        debug("🎬 Auto-playing next episode: " + nextEpisode.title);
+        // Auto-play next episode
+        setTimeout(function() {
+          stopVideo();
+          setTimeout(function() {
+            playEpisode(nextEpisode);
+          }, 500);
+        }, 1000);
+      } else if (state.videoPlayer.nextEpisodeDownloading) {
+        debug("⏳ Next episode still downloading, waiting...");
+        stopVideo();
+        showLoadingModal("Next Episode", "Preparing next episode...");
+        
+        // Wait for download to complete
+        waitForNextEpisode(nextEpisode);
+      } else {
+        debug("❌ Next episode not available, stopping playback");
+        stopVideo();
+      }
+    })
+    .catch(function(error) {
+      debug("❌ Error checking next episode: " + error.message);
       stopVideo();
-      setTimeout(function() {
-        playEpisode(nextEpisode);
-      }, 500);
-    }, 1000);
-  } else if (state.videoPlayer.nextEpisodeDownloading) {
-    debug("⏳ Next episode still downloading, showing progress modal");
-    // Show download progress modal
-    stopVideo();
-    showNextEpisodeDownloadModal(nextEpisode);
-  } else {
-    debug("❌ Next episode not available, stopping playback");
-    stopVideo();
-  }
+    });
+}
+
+function waitForNextEpisode(nextEpisode) {
+  debug("⏳ Waiting for next episode to be ready: " + nextEpisode.title);
+  
+  var checkInterval = setInterval(function() {
+    fetch(SERVER + "/direct/status/" + nextEpisode.msg_id)
+      .then(function(response) { return response.json(); })
+      .then(function(statusData) {
+        if (statusData.available) {
+          debug("✅ Next episode ready! Auto-playing...");
+          clearInterval(checkInterval);
+          hideLoadingModal();
+          
+          setTimeout(function() {
+            playEpisode(nextEpisode);
+          }, 500);
+        }
+      })
+      .catch(function(error) {
+        debug("❌ Error waiting for next episode: " + error.message);
+        clearInterval(checkInterval);
+        hideLoadingModal();
+      });
+  }, 3000); // Check every 3 seconds
+  
+  // Timeout after 2 minutes
+  setTimeout(function() {
+    clearInterval(checkInterval);
+    hideLoadingModal();
+    debug("⏰ Timeout waiting for next episode");
+  }, 120000); // 2 minutes
 }
 
 function showNextEpisodeDownloadModal(nextEpisode) {
