@@ -12,7 +12,6 @@ A comprehensive Netflix-like streaming platform that enables automated content m
 - **Multi-Platform Streaming**: Supports Smart TVs (Tizen OS), web browsers, and mobile devices
 - **Automated Content Pipeline**: Downloads and processes content from Telegram channels
 - **Cloud Storage Integration**: Seamlessly uploads to PixelDrain with intelligent management
-- **Real-time Streaming**: HLS (HTTP Live Streaming) support for adaptive playback
 
 ### 🔧 Advanced Features
 - **Queue Management**: Intelligent download scheduling and progress tracking
