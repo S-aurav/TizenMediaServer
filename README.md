@@ -24,8 +24,6 @@ A comprehensive Netflix-like streaming platform that enables automated content m
 ### 📱 Supported Platforms
 - **Samsung Tizen Smart TVs** (Tizen 4.0+)
 - **Web Browsers** (Chrome, Firefox, Safari, Edge)
-- **Mobile Devices** (iOS, Android)
-- **Desktop Applications**
 
 ## 🏗️ Architecture
 
@@ -51,9 +49,9 @@ A comprehensive Netflix-like streaming platform that enables automated content m
 
 ### Prerequisites
 - Python 3.9+
-- Node.js 16+ (for frontend)
+- Node.js 16+
 - Telegram API credentials
-- PixelDrain account (for cloud storage)
+- PixelDrain account
 
 ### 1. Clone Repository
 ```bash
@@ -157,5 +155,5 @@ GET /health              # Basic health check
 ```
 
 ### Documentation
-- [API Documentation](https://tizenmediaserver.onrender.com/docs)
+- [API Documentation](http://172.188.40.236:8000/docs)
 
